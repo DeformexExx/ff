@@ -8,12 +8,11 @@ logger = logging.getLogger("InjectionEngine")
 
 class InjectionEngine:
     @staticmethod
-    def inject_and_launch(clone_name: str, cookie: str, place_id: str = None, link_code: str = None, status_msg=None) -> bool:
+    async def inject_and_launch(clone_name: str, cookie: str, place_id: str = None, link_code: str = None, status_msg=None) -> bool:
         """
         The strictly ordered, pure-bash injection mechanism.
-        Возвращает True если запуск успешен, иначе False.
-        Обновляет статус через status_msg.edit_text(text) если передан.
         """
+        # Внутренняя функция для обновления статуса в ТГ
         async def update_status(text: str):
             logger.info(text)
             if status_msg:
@@ -23,7 +22,7 @@ class InjectionEngine:
                     pass
 
         try:
-            # 1. Skip Cleanup (V5.0 SAFE MODE)
+            # 1. Cleanup (Раскомментируй, если нужно убивать перед стартом)
             # await run_bash(f"su -c 'am force-stop com.roblox.{clone_name}'")
 
             # 2. SQLite Injection (STRICT BASH)
@@ -32,7 +31,7 @@ class InjectionEngine:
             sqlite_bin = "/data/data/com.termux/files/usr/bin/sqlite3"
             db_path = f"/data/data/com.roblox.{clone_name}/app_webview/Default/Cookies"
             
-            # Calculate Timestamp in microseconds
+            # Расчет временной метки (microseconds)
             current_time = int(time.time() * 1000000)
             
             sql_del = "DELETE FROM cookies;"
@@ -48,7 +47,7 @@ class InjectionEngine:
                 f");"
             )
             
-            # Form the full su command with escaped quotes for sqlite
+            # Команда для инъекции с экранированием
             inj_cmd = f"su -c \"{sqlite_bin} {db_path} \\\"{sql_del} {sql_ins}\\\"\""
             ret, stdout, stderr = await run_bash(inj_cmd)
             
@@ -63,37 +62,39 @@ class InjectionEngine:
             
             if ret != 0:
                 if "Permission denied" in stderr or "not found" in stderr:
-                    await update_status(f"❌ Root Error ({clone_name}): Устройство без Root или tsu не установлен.\n{stderr}")
+                    await update_status(f"❌ Root Error ({clone_name}): Нет Root или tsu не установлен.\n{stderr}")
                 else:
                     await update_status(f"❌ Chown Ошибка ({clone_name}):\n{stderr}")
                 return False
 
-            # 4. Launch (Monkey / Intent) (Golden Sequence)
+            # 4. Launch (Intent / Monkey)
             await update_status(f"⏳ ({clone_name}) 4/4: Запуск параметров сервера...")
             
+            # Вычисляем суффикс (b, c, d...)
             suffix = clone_name[-1].lower() if clone_name.lower().startswith("clien") else clone_name.lower()
+            pkg = f"com.roblox.clien{suffix}"
             
             ret = -1
+            # Попытка зайти сразу на сервер
             if place_id:
                 if link_code:
-                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}&linkCode={link_code}' -p com.roblox.clien{suffix}\""
+                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}&linkCode={link_code}' -p {pkg}\""
                 else:
-                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}' -p com.roblox.clien{suffix}\""
+                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}' -p {pkg}\""
+                
                 ret, stdout, stderr = await run_bash(join_cmd)
                 
                 if ret != 0:
                     logger.error(f"Intent fail for {clone_name}, falling back to monkey.")
             
+            # Если Intent не сработал или place_id не задан — запускаем через Monkey
             if ret != 0:
-                monkey_cmd = f"su -c \"monkey -p com.roblox.clien{suffix} -c android.intent.category.LAUNCHER 1\""
+                monkey_cmd = f"su -c \"monkey -p {pkg} -c android.intent.category.LAUNCHER 1\""
                 ret, stdout, stderr = await run_bash(monkey_cmd)
                 if ret != 0:
                     await update_status(f"❌ Monkey Error ({clone_name}):\n{stderr}")
                     return False
             
-            await update_status(f"✅ Запущено ({clone_name})")
-            return True
-                
             await update_status(f"✅ Запущено ({clone_name})")
             return True
             
