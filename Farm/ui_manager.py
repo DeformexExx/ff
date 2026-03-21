@@ -108,32 +108,28 @@ class UIManager:
             
             icon = "🔴"
             status_text = "Offline"
-            if state == "RUNNING":
-                icon = "🟢"
-                status_text = "Active"
-            elif state == "STARTING":
-                icon = "🟡"
-                status_text = "Injecting"
                 
             suffix = name[-1].upper() if name.startswith("clien") else name.upper()
 
             # Thread info
             thr_info = str(state_map.get(f"{name}:threads", "0"))
             
-            # Additional info
-            active_acc = clone.get("username", clone.get("cookie", "None")[:6]).replace('_', ' ')
-            if active_acc != "None":
-                active_acc = f"ID:{active_acc}"
+            # Account info
+            active_acc = clone.get("account")
+            if not active_acc:
+                active_acc = "Нет аккаунта"
+            else:
+                active_acc = active_acc.replace('_', ' ')
             
             acc_esc = html.escape(active_acc)
             thr_esc = html.escape(thr_info)
 
-            # 🟢 B | 142 th | Актив: Аккаунт1
-            # 🔴 C | Offline | Актив: None
             if state == "RUNNING":
-                msg += f"{icon} {suffix} | {thr_esc} th | Актив: {acc_esc}\n"
+                msg += f"🟢 {suffix} | {thr_esc} th | Актив: {acc_esc}\n"
+            elif state == "STARTING":
+                msg += f"⏳ {suffix} | Loading....\n"
             else:
-                msg += f"{icon} {suffix} | {status_text} | Актив: None\n"
+                msg += f"🔴 {suffix} | Offline | Актив: {acc_esc}\n"
 
         return msg.rstrip()
 
@@ -152,6 +148,10 @@ class UIManager:
                 for n in names[i:i+2]
             ]
             rows.append(row)
+        rows.append([
+            InlineKeyboardButton("🚀 МАСС СТАРТ", callback_data="mass_start"),
+            InlineKeyboardButton("🛑 МАСС СТОП", callback_data="mass_stop")
+        ])
         rows.append([InlineKeyboardButton("🏠 HOME", callback_data="nav_home")])
         return InlineKeyboardMarkup(rows)
 

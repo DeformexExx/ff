@@ -384,14 +384,25 @@ class AegisBot:
     async def open_clones_hub(self, update: Update):
         try:
             self.config.reload()
-            text = self._build_hub_text()
+            text = await self._build_hub_text()
             kb   = UIManager.get_clones_hub_keyboard(self.config.clones_data)
             self._dash_msg = await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
         except Exception as e:
             logger.error(f"open_clones_hub error: {e}")
             await update.message.reply_text(f"❌ Hub error: {e}")
 
-    def _build_hub_text(self) -> str:
+    async def _build_hub_text(self) -> str:
+        for c in self.config.clones_data:
+            name = c.get("name")
+            if not name: continue
+            raw_s = self.clone_states.get(name, CloneState.STOPPED)
+            state = str(raw_s).upper()
+            if state == "RUNNING":
+                st = await MonitorEngine.get_clone_status(name)
+                m_thr = re.search(r"Thr:\s*(\d+)", st)
+                thr = int(m_thr.group(1)) if m_thr else 0
+                self.clone_states[f"{name}:threads"] = str(thr)
+
         state_map  = {n: str(s) for n, s in self.clone_states.items()}
         return UIManager.format_clones_hub(self.config.clones_data, state_map, VERSION)
 
@@ -403,7 +414,7 @@ class AegisBot:
             return
             
         try:
-            text = self._build_hub_text()
+            text = await self._build_hub_text()
             kb   = UIManager.get_clones_hub_keyboard(self.config.clones_data)
             await self._dash_msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
             self._last_ui_update = now
@@ -442,6 +453,14 @@ class AegisBot:
             elif d == "sys_sync":  await self._git_sync(chat)
             elif d == "sys_screenshot": await self._take_screenshot(q.message)
             elif d == "sys_help": await q.message.reply_text(UIManager.get_help_text(), parse_mode="HTML")
+            
+            elif d == "mass_start":
+                asyncio.create_task(self._mass_start(chat_id))
+                await q.message.reply_text("🚀 Массовый запуск инициирован...", parse_mode="HTML")
+
+            elif d == "mass_stop":
+                asyncio.create_task(self._mass_stop(chat_id))
+                await q.message.reply_text("🛑 Массовая остановка инициирована...", parse_mode="HTML")
 
             elif d.startswith("start_"):
                 name = d[6:]
@@ -560,7 +579,7 @@ class AegisBot:
 
     async def _mass_start(self, chat_id):
         """Sequential mass start via the _start_lock queue."""
-        clones = self.config.clones_data
+        clones = [c for c in self.config.clones_data if c.get("active", True)]
         
         app = self.application
         if chat_id and app:
@@ -587,6 +606,25 @@ class AegisBot:
                 except Exception:
                     pass
             await self._enqueue_start(name, chat_id)
+
+    async def _mass_stop(self, chat_id):
+        """Sequential mass stop."""
+        app = self.application
+        if chat_id and app:
+            try:
+                await app.bot.send_message(chat_id, "🛑 <b>МАСС СТОП: остановка всех...</b>", parse_mode="HTML")
+            except Exception: pass
+            
+        for c in self.config.clones_data:
+            name = c.get("name")
+            if not name: continue
+            suffix = name[-1].lower() if name.startswith("clien") else name.lower()
+            await run_bash(f"su -c 'am force-stop com.roblox.clien{suffix}'")
+            self.set_state(name, CloneState.STOPPED)
+            self.persistence.remove_target(name)
+            self.config.update_clone_status(name, "OFFLINE")
+
+        await self.refresh_dashboard(force=True)
 
     async def _stop_clone(self, name: Optional[str], chat_id):
         if not name: return
