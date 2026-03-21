@@ -404,6 +404,40 @@ class AegisBot:
             logger.error(f"open_clones_hub error: {e}")
             await update.message.reply_text(f"❌ Hub error: {e}")
 
+    async def _get_clone_menu(self, clone_name: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Build and send per-clone control menu with correct account nickname mapping."""
+        suffix = clone_name.lower()
+        name_acc = clone_name
+        for clone in self.config.clones_data:
+            cfg_name = str(clone.get("name", "")).lower()
+            if cfg_name == suffix:
+                name_acc = clone.get("nickname") or clone.get("name") or clone_name
+                break
+
+        pid_suffix = suffix[-1].upper() if suffix.startswith("clien") else suffix.upper()
+        pid = await MonitorEngine.get_pid(pid_suffix)
+        thr = await MonitorEngine.get_threads(pid) if pid else 0
+
+        if thr > 130:
+            self.set_state(clone_name, CloneState.RUNNING)
+        elif thr == 0:
+            self.set_state(clone_name, CloneState.STOPPED)
+
+        name_esc = html.escape(clone_name.replace('_', '-'))
+        acc_esc = html.escape(str(name_acc).replace('_', '-'))
+
+        raw_state = self.clone_states.get(clone_name, CloneState.STOPPED)
+        state_val = str(raw_state)
+        kb = UIManager.get_clone_submenu(clone_name, state_val, thr)
+        status_rus = "Работает" if thr > 10 else "Остановлен"
+
+        text = f"⚙️ <b>{name_esc.upper()}</b>\n"
+        text += f"👤 Аккаунт: <code>{acc_esc}</code>\n"
+        text += f"Статус: <b>{status_rus}</b>\n"
+        text += f"Потоки: <code>{thr} th</code>"
+
+        await context.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+
     async def _build_hub_text(self) -> str:
         tasks = []
         for c in self.config.clones_data:
@@ -511,56 +545,7 @@ class AegisBot:
 
             elif d.startswith("clone_"):
                 c_name = d[6:]
-                name_acc = "Unknown"
-                
-                try:
-                    import json, os
-                    cfg_path = os.path.join(FARM_DIR, f"{DEVICE_ID}.json")
-                    if os.path.exists(cfg_path):
-                        with open(cfg_path, "r", encoding="utf-8") as f:
-                            cdata = json.load(f)
-                            for c in cdata.get("clones", []):
-                                if c.get("name") == c_name:
-                                    name_acc = c.get("account", "Unknown")
-                                    if name_acc == "Unknown" and c.get("nickname"):
-                                        name_acc = c.get("nickname")
-                                    break
-                except Exception:
-                    pass
-                
-                suffix = c_name[-1].upper() if c_name.lower().startswith("clien") else c_name.upper()
-                pid = await MonitorEngine.get_pid(suffix)
-                thr = await MonitorEngine.get_threads(pid) if pid else 0
-                
-                if thr > 130:
-                    self.set_state(c_name, CloneState.RUNNING)
-                elif thr == 0:
-                    self.set_state(c_name, CloneState.STOPPED)
-                
-                name_esc  = html.escape(c_name.replace('_', '-'))
-                acc_esc   = html.escape(name_acc.replace('_', '-'))
-                
-                raw_state = self.clone_states.get(c_name, CloneState.STOPPED)
-                state_val = str(raw_state)
-                
-                kb = UIManager.get_clone_submenu(c_name, state_val, thr)
-                
-                if thr > 10:
-                    status_rus = "Работает"
-                else:
-                    status_rus = "Остановлен"
-                
-                text = f"⚙️ <b>{name_esc.upper()}</b>\n"
-                text += f"👤 Аккаунт: <code>{acc_esc}</code>\n"
-                text += f"Статус: <b>{status_rus}</b>\n"
-                text += f"Потоки: <code>{thr} th</code>"
-                
-                await context.bot.send_message(
-                    chat,
-                    text,
-                    reply_markup=kb,
-                    parse_mode="HTML"
-                )
+                await self._get_clone_menu(c_name, chat, context)
 
             elif d == "maint_toggle":
                 self.maintenance_enabled = not self.maintenance_enabled
@@ -606,10 +591,7 @@ class AegisBot:
             return
 
         async with self._start_lock:
-            # ── 1. Force Identity & Inject ──────────────────────────────
             self.set_state(name, CloneState.STARTING)
-            
-            # V5.6 "NATIVE SIGHT": Check if already running
             status_str = await MonitorEngine.get_clone_status(name)
             if "Offline" not in status_str:
                 logger.info(f"Catch Running: {name} already has a PID. Skipping injection.")
@@ -633,7 +615,6 @@ class AegisBot:
                 except Exception:
                     pass
 
-            # V6.0 Explicit Cache Wipe before start
             suffix = name[-1].lower() if name.startswith("clien") else name.lower()
             await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
 
@@ -649,7 +630,6 @@ class AegisBot:
             except Exception as e:
                 logger.error(f"Failed parsing server config: {e}")
 
-            # V6.0 Universal Launch Sequence
             ok = await InjectionEngine.inject_and_launch(
                 name, ci.get("cookie"), p_id, l_code, sm)
 

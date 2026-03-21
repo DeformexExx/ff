@@ -1,19 +1,15 @@
-# -*- coding: utf-8 -*-
 import asyncio
 import logging
 import time
+import json
+import os
 from bash_utils import run_bash
 
 logger = logging.getLogger("InjectionEngine")
 
 class InjectionEngine:
     @staticmethod
-    async def inject_and_launch(clone_name: str, cookie: str, place_id=None, link_code=None, status_msg=None) -> bool:
-        """
-        The strictly ordered, pure-bash injection mechanism.
-        Возвращает True если запуск успешен, иначе False.
-        Обновляет статус через status_msg.edit_text(text) если передан.
-        """
+    async def inject_and_launch(clone_name: str, cookie: str, place_id: str = None, link_code: str = None, status_msg=None) -> bool:
         async def update_status(text: str):
             logger.info(text)
             if status_msg:
@@ -23,87 +19,60 @@ class InjectionEngine:
                     pass
 
         try:
-            suffix = clone_name[-1].lower() if clone_name.lower().startswith("clien") else clone_name.lower()
-            pkg = f"com.roblox.clien{suffix}"
+            server_link = None
+            if os.path.exists("server.json"):
+                with open("server.json", "r") as f:
+                    data = json.load(f)
+                    if isinstance(data, list) and len(data) > 0:
+                        server_link = data[0]
             
-            # 2. SQLite Injection (STRICT BASH)
-            await update_status(f"⏳ ({clone_name}) 2/4: Инъекция Cookie (BASH)...")
-            
-            # Clean Journal Files
-            await run_bash(f"su -c 'rm -f /data/data/{pkg}/app_webview/Default/Cookies-journal /data/data/{pkg}/app_webview/Default/Cookies-wal'")
-            
+            if not server_link:
+                await update_status(f"❌ Ссылка на сервер не найдена в server.json")
+                return False
+
+            await update_status(f"⏳ ({clone_name}) Инъекция Cookie...")
             sqlite_bin = "/data/data/com.termux/files/usr/bin/sqlite3"
-            db_path = f"/data/data/{pkg}/app_webview/Default/Cookies"
-            
-            # Calculate Timestamp in microseconds
+            db_path = f"/data/data/com.roblox.{clone_name}/app_webview/Default/Cookies"
             current_time = int(time.time() * 1000000)
             
             sql_del = "DELETE FROM cookies;"
             sql_ins = (
-                f"INSERT OR REPLACE INTO cookies "
-                f"(creation_utc, host_key, top_frame_site_key, name, value, path, expires_utc, is_secure, is_httponly, last_access_utc, has_expires, is_persistent, samesite, source_port) "
-                f"VALUES ({current_time}, '.roblox.com', '', '.ROBLOSECURITY', '{cookie}', '/', 253402300799000000, 1, 1, {current_time}, 1, 1, -1, -1);"
+                f"INSERT INTO cookies (creation_utc, host_key, top_frame_site_key, name, value, path, "
+                f"expires_utc, is_secure, is_httponly, last_access_utc, has_expires, is_persistent, samesite, source_port) "
+                f"VALUES ({current_time}, '.roblox.com', '', '.ROBLOSECURITY', '{cookie}', '/', 253402300799000000, 1, 1, "
+                f"{current_time}, 1, 1, -1, -1);"
             )
             
-            # Form the full su command with escaped quotes for sqlite
+            await run_bash(f"su -c 'rm -f {db_path}-journal {db_path}-wal'")
+            
             inj_cmd = f"su -c \"{sqlite_bin} {db_path} \\\"{sql_del} {sql_ins}\\\"\""
-            ret, stdout, stderr = await run_bash(inj_cmd)
-            
+            ret, _, stderr = await run_bash(inj_cmd)
             if ret != 0:
-                await update_status(f"❌ SQLite Ошибка ({clone_name}):\n{stderr}")
+                await update_status(f"❌ SQLite Ошибка: {stderr}")
                 return False
 
-            # 3. Permissions Fix (CRITICAL)
-            await update_status(f"⏳ ({clone_name}) 3/4: Восстановление прав...")
-            chown_cmd = f"su -c \"chown \\$(stat -c %u:%g /data/data/{pkg}) {db_path}\""
-            ret, stdout, stderr = await run_bash(chown_cmd)
-            
-            # Recovery Force
-            await run_bash(f"su -c 'chmod 600 {db_path}'")
-            
-            if ret != 0:
-                if "Permission denied" in stderr or "not found" in stderr:
-                    await update_status(f"❌ Root Error ({clone_name}): Устройство без Root или tsu не установлен.\n{stderr}")
-                else:
-                    await update_status(f"❌ Chown Ошибка ({clone_name}):\n{stderr}")
-                return False
+            await update_status(f"⏳ ({clone_name}) Восстановление прав...")
+            chown_cmd = f"su -c \"chown \\$(stat -c %u:%g /data/data/com.roblox.{clone_name}) {db_path}\""
+            await run_bash(chown_cmd)
 
-            # 4. Launch (Monkey / Intent) (Golden Sequence)
-            await update_status(f"⏳ ({clone_name}) 4/4: Запуск параметров сервера...")
+            await update_status(f"🚀 ({clone_name}) Запуск на сервер...")
+            await run_bash(f"su -c 'am force-stop com.roblox.{clone_name}'")
             
-            ret = -1
-            if link_code:
-                server_link = f"https://www.roblox.com/share?code={link_code}&type=Server"
-                join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d '{server_link}' {pkg}\""
-                ret, stdout, stderr = await run_bash(join_cmd)
-                
-                if ret != 0:
-                    logger.error(f"Intent fail for {clone_name}, falling back to monkey.")
+            launch_cmd = f"su -c \"am start -a android.intent.action.VIEW -d '{server_link}' com.roblox.{clone_name}\""
+            ret, _, stderr = await run_bash(launch_cmd)
+            
+            if ret == 0:
+                await update_status(f"✅ Запущено ({clone_name})")
+                return True
             else:
-                await update_status(f"❌ Ссылка на сервер не найдена в server.json")
-            
-            if ret != 0:
-                monkey_cmd = f"su -c 'monkey -p {pkg} 1'"
-                ret, stdout, stderr = await run_bash(monkey_cmd)
-                if ret != 0:
-                    await update_status(f"❌ Monkey Error ({clone_name}):\n{stderr}")
-                    return False
-            
-            await update_status(f"✅ Запущено ({clone_name})")
-            return True
-            
+                await update_status(f"❌ Ошибка запуска: {stderr}")
+                return False
+
         except Exception as e:
-            logger.error(f"Launch Sequence Error for {clone_name}: {e}")
-            await update_status(f"❌ Критическая ошибка ({clone_name}): {str(e)}")
+            await update_status(f"❌ Критическая ошибка: {str(e)}")
             return False
 
     @staticmethod
     async def stop(clone_name: str) -> bool:
-        ret, stdout, stderr = await run_bash(f"su -c 'am force-stop com.roblox.{clone_name}'")
-        return ret == 0
-
-    @staticmethod
-    async def clean(clone_name: str) -> bool:
-        await InjectionEngine.stop(clone_name)
-        ret, stdout, stderr = await run_bash(f"su -c 'rm -rf /data/data/com.roblox.{clone_name}/cache/*'")
+        ret, _, _ = await run_bash(f"su -c 'am force-stop com.roblox.{clone_name}'")
         return ret == 0
