@@ -160,9 +160,9 @@ class UIManager:
         
         rows = []
         if state_str in ("STOPPED", "COOLDOWN", "OFFLINE"):
-            rows.append([InlineKeyboardButton("⚡️ Start",    callback_data=f"start_{name}")])
+            rows.append([InlineKeyboardButton("▶️ START",    callback_data=f"start_{name}")])
         elif state_str == "RUNNING":
-            rows.append([InlineKeyboardButton("❄️ Stop",     callback_data=f"stop_{name}")])
+            rows.append([InlineKeyboardButton("⏸ STOP",      callback_data=f"stop_{name}")])
             rows.append([InlineKeyboardButton("♻️ Relaunch", callback_data=f"start_{name}")])
         else:
             # STARTING — show abort

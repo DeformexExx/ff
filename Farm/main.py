@@ -132,12 +132,14 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                     if thr == 0:
                         reason       = "Dead (Threads: 0)"
                         needs_action = True
+                        bot_instance.config.update_clone_status(name, "RESTARTING")
                     elif 0 < thr < 130:
                         low_thread_strikes[name] = low_thread_strikes.get(name, 0) + 1
                         logger.info(f"[{name.upper()}] Low threads: {thr}. Strike {low_thread_strikes[name]}/6.")
                         if low_thread_strikes[name] >= 6:
                             reason       = f"Freeze (Thr:{thr}<130 for 3m)"
                             needs_action = True
+                            bot_instance.config.update_clone_status(name, "RESTARTING")
                     else:
                         low_thread_strikes[name] = 0
 
@@ -207,11 +209,23 @@ class AegisBot:
         # asyncio.Lock — only ONE clone in STARTING state at a time
         self._start_lock = asyncio.Lock()
 
+        # V6.0 Calibration: Mass operations control
+        self.is_mass_starting = False
+
         # Initialize all known clones to STOPPED
         for c in self.config.clones_data:
             n = c.get("name")
             if n:
                 self.clone_states[n] = CloneState.STOPPED
+
+    def reset_all_states(self):
+        """V6.0 Calibration: Force all to STOPPED. No auto-start."""
+        self.is_mass_starting = False
+        for c in self.config.clones_data:
+            n = c.get("name")
+            if n:
+                self.set_state(n, CloneState.STOPPED)
+                self.config.update_clone_status(n, "OFFLINE")
 
     # ── State helpers ─────────────────────────────────────────────────────
     def set_state(self, name: str, state: CloneState):
@@ -492,8 +506,19 @@ class AegisBot:
                 name = "Unknown"
                 for c in self.config.clones_data:
                     if c.get("name") == c_name:
-                        name = c.get("account", "Unknown")
+                        name = c.get("account", "Not Set")
                         break
+                
+                # V6.0 Calibration: If threads > 130, assume RUNNING automatically
+                suffix = c_name[-1].upper() if c_name.lower().startswith("clien") else c_name.upper()
+                pid = await MonitorEngine.get_pid(suffix)
+                thr = await MonitorEngine.get_threads(pid) if pid else 0
+                
+                if thr > 130:
+                    self.set_state(c_name, CloneState.RUNNING)
+                elif thr == 0:
+                    # Enforce stopped if process is dead
+                    self.set_state(c_name, CloneState.STOPPED)
                 
                 name_esc  = html.escape(c_name.replace('_', '-'))
                 acc_esc   = html.escape(name.replace('_', '-'))
@@ -606,6 +631,7 @@ class AegisBot:
 
     async def _mass_start(self, chat_id):
         """Sequential mass start via the _start_lock queue."""
+        self.is_mass_starting = True
         clones = [c for c in self.config.clones_data if c.get("active", True)]
         
         app = self.application
@@ -625,6 +651,10 @@ class AegisBot:
             await m.edit_text("🚀 <b>Запуск фермы инициирован... Чистка кэша завершена.</b>", parse_mode="HTML")
                 
             for idx, c in enumerate(clones, 1):
+                if not self.is_mass_starting:
+                    logger.info("Mass start interrupted.")
+                    break
+                
                 name = c.get("name")
                 if not name: continue
                 await app.bot.send_message(
@@ -635,14 +665,19 @@ class AegisBot:
                 await self._enqueue_start(name, chat_id)
         except Exception as e:
             logger.error(f"Mass Start Error: {e}")
+        finally:
+            self.is_mass_starting = False
 
     async def _mass_stop(self, chat_id):
-        """Sequential mass stop."""
+        """Sequential mass stop with instant interrupt."""
+        self.is_mass_starting = False
         app = self.application
         if not (chat_id and app): return
 
         try:
-            m = await app.bot.send_message(chat_id, "🛑 <b>МАСС СТОП: остановка всех...</b>", parse_mode="HTML")
+            m = await app.bot.send_message(chat_id, "🛑 <b>МАСС СТОП: остановка процессов...</b>", parse_mode="HTML")
+            
+            await run_bash('su -c "pkill -9 com.roblox"')
             
             for c in self.config.clones_data:
                 name = c.get("name")
@@ -922,8 +957,8 @@ class AegisBot:
         # 5b. Launch Maintenance Timer
         asyncio.create_task(self._maint_timer_loop())
 
-        # 6. Auto-resume (V5.7 Smart sequence)
-        asyncio.create_task(self._auto_resume())
+        # 6. Auto-resume (V6.0 Calibration: Force STOPPED, No Auto-resume by default)
+        self.reset_all_states()
 
         logger.info(f"💎 PROJECT AEGIS V{VERSION} ONLINE — {DEVICE_ID}")
 
