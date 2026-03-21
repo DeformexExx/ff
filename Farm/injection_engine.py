@@ -8,7 +8,7 @@ logger = logging.getLogger("InjectionEngine")
 
 class InjectionEngine:
     @staticmethod
-    async def inject_and_launch(clone_name: str, cookie: str, server_link: str = None, status_msg=None) -> bool:
+    async def inject_and_launch(clone_name: str, cookie: str, place_id=None, link_code=None, status_msg=None) -> bool:
         """
         The strictly ordered, pure-bash injection mechanism.
         Возвращает True если запуск успешен, иначе False.
@@ -72,7 +72,8 @@ class InjectionEngine:
             await update_status(f"⏳ ({clone_name}) 4/4: Запуск параметров сервера...")
             
             ret = -1
-            if server_link:
+            if link_code:
+                server_link = f"https://www.roblox.com/share?code={link_code}&type=Server"
                 join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d '{server_link}' {pkg}\""
                 ret, stdout, stderr = await run_bash(join_cmd)
                 
