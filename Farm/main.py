@@ -125,70 +125,104 @@ async def watchdog_safe_restart(
 
 async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
     """
-    Тройная проверка (RUNNING):
-    1) Процесс — clone_pgrep_alive False
-    2) Потоки — th < 130 (после grace 120 с)
-    3) CPU — < 2% непрерывно 120 с при th >= 130 (top)
+    Three-stage guardian — runs every 60 s per clone:
+    Stage 1 — Liveness:  pgrep returns no PID → RESTART
+    Stage 2 — Threads:   threads < 145 after grace → RESTART (phantom if threads==0 but alive)
+    Stage 3 — Freeze:    utime+stime from /proc/stat unchanged for 120s → RESTART
     """
-    GRACE_SEC = 120
-    MIN_THREADS = 130
-    CPU_FREEZE_PCT = 2.0
-    CPU_FREEZE_SEC = 120
+    GRACE_SEC    = 120
+    MIN_THREADS  = 145
+    FREEZE_SEC   = 120
+    POLL_SEC     = 60
+
+    # Per-clone /proc/stat baseline: {name: (ticks, timestamp)}
+    stat_baseline: Dict[str, tuple] = {}
+
+    async def _read_ticks(pid: str) -> Optional[int]:
+        """Read utime+stime from /proc/{pid}/stat in one su call."""
+        _, out, _ = await run_bash(f"su -c 'cat /proc/{pid}/stat 2>/dev/null'")
+        raw = out.strip()
+        if not raw:
+            return None
+        try:
+            fields = raw.split()
+            return int(fields[13]) + int(fields[14])
+        except (IndexError, ValueError):
+            return None
 
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(POLL_SEC)
         try:
             now = time.time()
             for name, state in list(bot_instance.clone_states.items()):
                 if ":" in name:
                     continue
                 if state != CloneState.RUNNING:
+                    stat_baseline.pop(name, None)
                     continue
 
                 suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
                 uptime = now - bot_instance.running_since.get(name, now)
 
+                # ── Stage 1: Liveness ─────────────────────────────────────────
                 alive = await clone_pgrep_alive(suffix)
                 if not alive:
-                    logger.warning(f"Watchdog [{name}]: liveness fail")
+                    stat_baseline.pop(name, None)
+                    logger.warning(f"Watchdog [{name}]: Stage1 — no process")
                     await watchdog_safe_restart(
                         application, bot_instance, name, "нет процесса (pgrep)"
                     )
                     continue
 
-                st = await MonitorEngine.get_clone_status(name)
-                m_thr = re.search(r"Thr:\s*(\d+)", st)
-                thr = int(m_thr.group(1)) if m_thr else 0
+                # ── Stage 2: Threads ──────────────────────────────────────────
+                pid = await MonitorEngine.get_pid(suffix)
+                thr = await MonitorEngine.get_threads(pid) if pid else 0
                 bot_instance.clone_states[f"{name}:threads"] = str(thr)
 
+                # Phantom: alive but 0 threads
+                if alive and thr == 0:
+                    stat_baseline.pop(name, None)
+                    logger.warning(f"Watchdog [{name}]: Stage2 — phantom (alive but 0 threads)")
+                    bot_instance.set_state(name, CloneState.STOPPED)
+                    asyncio.create_task(bot_instance._enqueue_start(name,
+                        bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None))
+                    continue
+
                 if uptime >= GRACE_SEC and thr < MIN_THREADS:
-                    logger.warning(f"Watchdog [{name}]: threads {thr} < {MIN_THREADS}")
+                    stat_baseline.pop(name, None)
+                    logger.warning(f"Watchdog [{name}]: Stage2 — threads {thr} < {MIN_THREADS}")
                     await watchdog_safe_restart(
                         application, bot_instance, name, f"потоки {thr} < {MIN_THREADS}"
                     )
                     continue
 
-                if uptime >= GRACE_SEC and thr >= MIN_THREADS:
-                    cpu = await MonitorEngine.get_clone_cpu_percent(suffix)
-                    if cpu < 0:
-                        bot_instance.watchdog_cpu_low_since.pop(name, None)
-                    elif cpu < CPU_FREEZE_PCT:
-                        t0 = bot_instance.watchdog_cpu_low_since.get(name)
-                        if t0 is None:
-                            bot_instance.watchdog_cpu_low_since[name] = now
-                        elif now - t0 >= CPU_FREEZE_SEC:
-                            logger.warning(
-                                f"Watchdog [{name}]: CPU {cpu}% < {CPU_FREEZE_PCT}% {CPU_FREEZE_SEC}s"
-                            )
-                            await watchdog_safe_restart(
-                                application,
-                                bot_instance,
-                                name,
-                                f"CPU < {CPU_FREEZE_PCT}% {CPU_FREEZE_SEC}s",
-                            )
-                            continue
+                # ── Stage 3: Freeze (/proc/stat delta) ────────────────────────
+                if uptime >= GRACE_SEC and pid:
+                    ticks_now = await _read_ticks(pid)
+                    if ticks_now is not None:
+                        baseline = stat_baseline.get(name)
+                        if baseline is None:
+                            stat_baseline[name] = (ticks_now, now)
+                        else:
+                            ticks_prev, ts_prev = baseline
+                            if ticks_now == ticks_prev:
+                                # No CPU activity
+                                if now - ts_prev >= FREEZE_SEC:
+                                    stat_baseline.pop(name, None)
+                                    logger.warning(
+                                        f"Watchdog [{name}]: Stage3 — frozen {FREEZE_SEC}s (ticks unchanged)"
+                                    )
+                                    await watchdog_safe_restart(
+                                        application, bot_instance, name,
+                                        f"заморожен {FREEZE_SEC}s (CPU delta=0)"
+                                    )
+                                    continue
+                                # else: still within window, keep baseline
+                            else:
+                                # Activity detected — reset baseline
+                                stat_baseline[name] = (ticks_now, now)
                     else:
-                        bot_instance.watchdog_cpu_low_since.pop(name, None)
+                        stat_baseline.pop(name, None)
 
             await bot_instance.refresh_dashboard()
         except Exception as e:
@@ -651,17 +685,26 @@ class AegisBot:
             # ── GK: Ghost Killer — strict liveness via ps -A (zombie-aware) ──
             alive = await clone_pgrep_alive(suffix)
             if alive:
-                # Process is genuinely running — mark it and skip injection
-                self.set_state(name, CloneState.RUNNING)
-                app = self.application
-                if chat_id and app:
-                    try:
-                        await app.bot.send_message(
-                            chat_id,
-                            f"👁 <code>{html.escape(name.replace('_','-'))}</code> уже запущен.",
-                            parse_mode="HTML")
-                    except Exception: pass
-                return
+                # Check for phantom: alive but 0 threads = black screen / zombie ghost
+                pid = await MonitorEngine.get_pid(suffix)
+                thr = await MonitorEngine.get_threads(pid) if pid else 0
+                if thr == 0:
+                    # Phantom detected — force-stop and proceed with launch
+                    logger.warning(f"_enqueue_start [{name}]: phantom (alive, threads=0) — killing")
+                    await run_bash(f"su -c 'am force-stop {pkg}'")
+                    await asyncio.sleep(3)
+                else:
+                    # Process is genuinely running — mark it and skip injection
+                    self.set_state(name, CloneState.RUNNING)
+                    app = self.application
+                    if chat_id and app:
+                        try:
+                            await app.bot.send_message(
+                                chat_id,
+                                f"👁 <code>{html.escape(name.replace('_','-'))}</code> уже запущен.",
+                                parse_mode="HTML")
+                        except Exception: pass
+                    return
 
             # If JSON said RUNNING but process is dead → auto-correct to IDLE
             if self.clone_states.get(name) == CloneState.RUNNING:
@@ -680,12 +723,12 @@ class AegisBot:
                 except Exception:
                     pass
 
-            # ── GK: Force-stop phantom before launch + grouped deep clean ──
+            # ── V10.1: Force-stop + 5s RAM release + grouped deep clean ──────
             await run_bash(
                 f"su -c 'am force-stop {pkg}; sync; echo 3 > /proc/sys/vm/drop_caches; "
                 f"rm -rf /data/data/{pkg}/cache/*'"
             )
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)  # allow system to fully reclaim RAM
 
             import json as _json
             p_id, l_code = None, None
@@ -797,10 +840,14 @@ class AegisBot:
         await self.refresh_dashboard(force=True)
 
     async def _stop_clone(self, name: Optional[str], chat_id):
+        """Stop a single clone — ONLY am force-stop, never pkill (would kill neighbours)."""
         if not name: return
         self.set_state(name, CloneState.STOPPED)
         self.persistence.remove_target(name)
-        await InjectionEngine.stop(name)
+        suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
+        # Official Android method — isolates only this package
+        await run_bash(f"su -c 'am force-stop com.roblox.clien{suffix}'")
+        await asyncio.sleep(5)  # let system free RAM before next action
         app = self.application
         if chat_id and app:
             try:

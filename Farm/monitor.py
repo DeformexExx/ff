@@ -164,70 +164,80 @@ class MonitorEngine:
 
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
-    async def get_clone_cpu_percent(suffix: str) -> float:
+    async def get_clone_cpu_percent(suffix: str, _prev_cache: dict = {}) -> float:
         """
         CPU % for com.roblox.clien{suffix}.
 
-        Strategy:
-          1. top -n 1  (Android/Termux — no -b flag)
-          2. grep the package line and extract the CPU column.
-          3. /proc/{pid}/stat fallback (utime+stime delta) if top gives nothing.
+        Strategy (V10.1):
+          1. PRIMARY: /proc/{pid}/stat utime+stime delta over 0.8s sample.
+          2. FALLBACK: top -n 1 | grep {pkg} — only if stat delta yields 0.
+          3. If both give 0 or empty — return the last known value (don't drop to 0 in UI).
 
-        Returns -1.0 if process not found or any error.
+        Returns -1.0 only when process is genuinely not found.
+        _prev_cache: module-level dict keyed by suffix, stores last good value.
         """
+        import time as _time
+        import asyncio as _asyncio
         pkg = f"com.roblox.clien{suffix}"
 
-        # ── attempt 1: top (Android does NOT support -b) ─────────────────────
+        # ── Step 1: get PID via single su call ───────────────────────────────
+        _, pg_out, _ = await run_bash(f"su -c 'pgrep -f {pkg} | head -n 1'")
+        pid = pg_out.strip().splitlines()[0].strip() if pg_out.strip() else ""
+        if not pid or not pid.isdigit():
+            _prev_cache.pop(suffix, None)
+            return -1.0
+
+        # ── Step 2: /proc/stat delta (primary) ───────────────────────────────
+        def _read_ticks(p: str) -> Optional[int]:
+            try:
+                with open(f"/proc/{p}/stat", "r") as f:
+                    fields = f.read().split()
+                return int(fields[13]) + int(fields[14])
+            except Exception:
+                return None
+
+        t0 = _time.monotonic()
+        ticks0 = _read_ticks(pid)
+        if ticks0 is None:
+            _prev_cache.pop(suffix, None)
+            return -1.0
+
+        await _asyncio.sleep(0.8)
+
+        t1 = _time.monotonic()
+        ticks1 = _read_ticks(pid)
+        if ticks1 is None:
+            _prev_cache.pop(suffix, None)
+            return -1.0
+
+        hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        elapsed = t1 - t0
+        cpu = round(max(((ticks1 - ticks0) / hz) / elapsed * 100.0, 0.0), 1)
+
+        if cpu > 0:
+            _prev_cache[suffix] = cpu
+            return cpu
+
+        # ── Step 3: top fallback if stat delta = 0 ───────────────────────────
         _, top_out, _ = await run_bash(f"su -c \"top -n 1 | grep {pkg}\"")
         line = top_out.strip().splitlines()[0] if top_out.strip() else ""
         if line:
-            # Android top output: PID USER PR NI ... %CPU %MEM ...
-            # The CPU column position can vary; grab the first bare percentage.
             m = re.search(r"(\d+(?:\.\d+)?)%", line)
             if m:
                 try:
-                    return float(m.group(1))
+                    top_cpu = float(m.group(1))
+                    if top_cpu > 0:
+                        _prev_cache[suffix] = top_cpu
+                        return top_cpu
                 except ValueError:
                     pass
 
-        # ── attempt 2: /proc/{pid}/stat delta ────────────────────────────────
-        try:
-            import time
-            _, pg_out, _ = await run_bash(f"su -c 'pgrep -f {pkg}'")
-            pid = pg_out.strip().splitlines()[0].strip() if pg_out.strip() else ""
-            if not pid or not pid.isdigit():
-                return -1.0
+        # ── Step 4: keep last known value — don't flash 0% in UI ─────────────
+        last = _prev_cache.get(suffix)
+        if last is not None:
+            return last  # stale but better than 0
 
-            def _read_stat(p: str) -> Optional[int]:
-                try:
-                    with open(f"/proc/{p}/stat", "r") as f:
-                        fields = f.read().split()
-                    # utime = fields[13], stime = fields[14]
-                    return int(fields[13]) + int(fields[14])
-                except Exception:
-                    return None
-
-            t0 = time.monotonic()
-            ticks0 = _read_stat(pid)
-            if ticks0 is None:
-                return -1.0
-
-            import asyncio
-            await asyncio.sleep(0.5)
-
-            t1 = time.monotonic()
-            ticks1 = _read_stat(pid)
-            if ticks1 is None:
-                return -1.0
-
-            hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-            elapsed = t1 - t0
-            cpu = ((ticks1 - ticks0) / hz) / elapsed * 100.0
-            return round(max(cpu, 0.0), 1)
-
-        except Exception as e:
-            logger.debug(f"get_clone_cpu_percent fallback error [{suffix}]: {e}")
-            return -1.0
+        return 0.0  # truly unknown, process may be idle
 
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
