@@ -491,6 +491,14 @@ class AegisBot:
                 asyncio.create_task(self._mass_stop(chat))
                 await q.message.reply_text("🛑 Массовая остановка инициирована...", parse_mode="HTML")
 
+            elif d.startswith("start_single_"):
+                name = d[13:]
+                asyncio.create_task(self._start_single(name, chat))
+
+            elif d.startswith("stop_single_"):
+                name = d[12:]
+                asyncio.create_task(self._stop_clone(name, chat))
+
             elif d.startswith("start_"):
                 name = d[6:]
                 asyncio.create_task(self._enqueue_start(name, chat))
@@ -525,12 +533,17 @@ class AegisBot:
                 raw_state = self.clone_states.get(c_name, CloneState.STOPPED)
                 state_val = str(raw_state)
                 
-                s_val_esc = html.escape(state_val)
-                kb    = UIManager.get_clone_submenu(c_name, state_val)
+                kb = UIManager.get_clone_submenu(c_name, state_val, thr)
+                
+                if thr > 10:
+                    status_rus = "Работает"
+                else:
+                    status_rus = "Остановлен"
                 
                 text = f"⚙️ <b>{name_esc.upper()}</b>\n"
                 text += f"👤 Аккаунт: <code>{acc_esc}</code>\n"
-                text += f"State: <code>{s_val_esc}</code>"
+                text += f"Статус: <b>{status_rus}</b>\n"
+                text += f"Потоки: <code>{thr}</code>"
                 
                 await context.bot.send_message(
                     chat,
@@ -624,9 +637,32 @@ class AegisBot:
             else:
                 self.set_state(name, CloneState.STOPPED)
 
-            # Global 10s stagger delay between starts to avoid CPU spikes
-            await asyncio.sleep(10)
+        # Global 10s stagger delay between starts to avoid CPU spikes
+        await asyncio.sleep(10)
 
+        await self.refresh_dashboard(force=True)
+
+    async def _start_single(self, name: str, chat_id):
+        """V6.0 Individual Clone Control (Start)"""
+        if not name: return
+        suffix = name[-1].lower() if name.startswith("clien") else name.lower()
+        
+        # 1. Clear cache
+        await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
+        # 2. Start Activity
+        await run_bash(f"su -c 'am start -n com.roblox.clien{suffix}/com.roblox.client.Activity'")
+        
+        self.set_state(name, CloneState.STARTING)
+        self.config.update_clone_status(name, "STARTING")
+        
+        app = self.application
+        if chat_id and app:
+            try:
+                name_esc = html.escape(name.replace('_', '-'))
+                await app.bot.send_message(
+                    chat_id, f"🚀 <code>{name_esc}</code>: Activity Запущена...", parse_mode="HTML")
+            except Exception:
+                pass
         await self.refresh_dashboard(force=True)
 
     async def _mass_start(self, chat_id):

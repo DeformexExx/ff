@@ -153,20 +153,16 @@ class UIManager:
 
     # ── CLONE SUB-MENU ────────────────────────────────────────────────────
     @staticmethod
-    def get_clone_submenu(name: str, state: Any) -> InlineKeyboardMarkup:
+    def get_clone_submenu(name: str, state: Any, threads: int = 0) -> InlineKeyboardMarkup:
         """Individual clone control keyboard."""
-        # Fix Enum vs str bug
         state_str = str(state).upper()
         
         rows = []
-        if state_str in ("STOPPED", "COOLDOWN", "OFFLINE"):
-            rows.append([InlineKeyboardButton("▶️ START",    callback_data=f"start_{name}")])
-        elif state_str == "RUNNING":
-            rows.append([InlineKeyboardButton("⏸ STOP",      callback_data=f"stop_{name}")])
-            rows.append([InlineKeyboardButton("♻️ Relaunch", callback_data=f"start_{name}")])
-        else:
-            # STARTING — show abort
-            rows.append([InlineKeyboardButton("❌ Abort",    callback_data=f"stop_{name}")])
+        if state_str in ("STOPPED", "COOLDOWN", "OFFLINE") or threads < 10:
+            rows.append([InlineKeyboardButton("▶️ START CLONE", callback_data=f"start_single_{name}")])
+        elif threads >= 10:
+            rows.append([InlineKeyboardButton("🛑 STOP CLONE",  callback_data=f"stop_single_{name}")])
+
         rows.append([InlineKeyboardButton("📸 Screenshot",   callback_data=f"shot_{name}")])
         rows.append([InlineKeyboardButton("🏠 Back to Hub",  callback_data="nav_home")])
         return InlineKeyboardMarkup(rows)
