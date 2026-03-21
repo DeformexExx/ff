@@ -41,7 +41,7 @@ class MonitorEngine:
         suffix = clone_name[-1] if clone_name.startswith("clien") else clone_name
         
         # 1. PID Discovery (V6.0 confirmed awk chain)
-        cmd_pid = f"su -c \"ps -ef | grep com.roblox.clien{suffix} | grep -v grep | awk '{{print $2}}'\""
+        cmd_pid = f"su -c \"ps -A | grep com.roblox.clien{suffix} | grep -v grep | awk '{{print $2}}'\""
         ret, stdout_pid, _ = await run_bash(cmd_pid)
         
         # Robust validation: check for error strings or multiple lines
@@ -59,7 +59,7 @@ class MonitorEngine:
             _, stdout_thr, _ = await run_bash(cmd_thr)
             
             raw_thr = stdout_thr.strip()
-            if any(err in raw_thr for err in ["rooting", "No such", "denied"]):
+            if any(err in raw_thr for err in ["rooting", "No such", "denied"]) or not raw_thr:
                 threads = 0
             else:
                 try:

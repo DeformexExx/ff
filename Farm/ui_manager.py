@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
-# ui_manager.py — Project Aegis V4.0 Dark Premium
 import re
+import html
 from typing import Any
 from telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -22,11 +21,13 @@ class UIManager:
     # ── WELCOME ───────────────────────────────────────────────────────────
     @staticmethod
     def get_welcome_text(device_id: str, version: str) -> str:
+        d_esc = html.escape(device_id)
+        v_esc = html.escape(version)
         return (
-            f"💎 *AEGIS OVERLORD {version}*\n"
+            f"💎 <b>AEGIS V{v_esc} — DIAMOND CUT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡️ SYSTEM : `[💠 ONLINE (SAFE)]`\n"
-            f"📱 DEVICE : `{device_id}`\n"
+            f"⚡️ SYSTEM : <code>[💠 ONLINE (SAFE)]</code>\n"
+            f"📱 DEVICE : <code>{d_esc}</code>\n"
             "━━━━━━━━━━━━━━━━━━━━"
         )
 
@@ -40,15 +41,20 @@ class UIManager:
 
     @staticmethod
     def format_dashboard(device_id: str, ram: str, cpu: str, temp: str, version: str) -> str:
+        d_esc = html.escape(device_id)
+        v_esc = html.escape(version)
+        r_esc = html.escape(ram)
+        c_esc = html.escape(cpu)
+        t_esc = html.escape(temp)
         return (
-            f"💎 *AEGIS {version}*\n"
+            f"💎 <b>AEGIS V{v_esc} — DIAMOND CUT</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"📱 DEVICE  : `{device_id}`\n"
-            f"🐕 WATCHDOG: `[DEEP MONITOR 🔒]`\n"
+            f"📱 DEVICE  : <code>{d_esc}</code>\n"
+            f"🐕 WATCHDOG: <code>[DEEP MONITOR 🔒]</code>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🧠 RAM: {ram} | 🚀 CPU: {cpu} | 🌡 TEMP: {temp}\n"
+            f"🧠 RAM: {r_esc} | 🚀 CPU: {c_esc} | 🌡 TEMP: {t_esc}\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "✨ _Advanced Telemetry Active_"
+            "✨ <i>Advanced Telemetry Active</i>"
         )
 
     @staticmethod
@@ -85,19 +91,20 @@ class UIManager:
         """
         state_map:  {clone_name: CloneState (str value)}
         """
-        msg = f"💎 *AEGIS OVERLORD {version}*\n"
+        v_esc = html.escape(version)
+        msg = f"💎 <b>AEGIS V{v_esc} — DIAMOND CUT</b>\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
         if not clones_data:
-            msg += "_No clones configured._"
+            msg += "<i>No clones configured.</i>"
             return msg
 
         # Compact Tabular format
         for clone in clones_data:
-            name  = clone.get("name", "Unknown")
+            name  = clone.get("name", "Unknown").replace('_', ' ')
             # Bugfix: Handle Hub Error explicitly
             raw_s = state_map.get(name, "STOPPED")
-            state = str(raw_s.value if hasattr(raw_s, 'value') else raw_s).upper()
+            state = str(raw_s).upper()
             
             icon = "🔴"
             status_text = "Offline"
@@ -111,17 +118,20 @@ class UIManager:
             suffix = name[-1].upper() if name.startswith("clien") else name.upper()
 
             # Thread info
-            thr_info = state_map.get(f"{name}:threads", "0")
+            thr_info = str(state_map.get(f"{name}:threads", "0"))
             
             # Additional info
-            active_acc = clone.get("username", clone.get("cookie", "None")[:6])
+            active_acc = clone.get("username", clone.get("cookie", "None")[:6]).replace('_', ' ')
             if active_acc != "None":
                 active_acc = f"ID:{active_acc}"
+            
+            acc_esc = html.escape(active_acc)
+            thr_esc = html.escape(thr_info)
 
             # 🟢 B | 142 th | Актив: Аккаунт1
             # 🔴 C | Offline | Актив: None
             if state == "RUNNING":
-                msg += f"{icon} {suffix} | {thr_info} th | Актив: {active_acc}\n"
+                msg += f"{icon} {suffix} | {thr_esc} th | Актив: {acc_esc}\n"
             else:
                 msg += f"{icon} {suffix} | {status_text} | Актив: None\n"
 
@@ -149,8 +159,8 @@ class UIManager:
     @staticmethod
     def get_clone_submenu(name: str, state: Any) -> InlineKeyboardMarkup:
         """Individual clone control keyboard."""
-        # Fix Enum vs str bug (V5.7 Reconstruction)
-        state_str = str(state.value if hasattr(state, 'value') else state).upper()
+        # Fix Enum vs str bug
+        state_str = str(state).upper()
         
         rows = []
         if state_str in ("STOPPED", "COOLDOWN", "OFFLINE"):
@@ -169,10 +179,10 @@ class UIManager:
     @staticmethod
     def get_help_text() -> str:
         return (
-            "🛡 *AEGIS V5.0 SAFE MODE*\n\n"
-            "• Watchdog: *Silent* for 10 mins after boot\n"
-            "• Startup: Set Identity -> Inject -> Launch (No Cleanup)\n"
-            "• UI Refresh: Throttled to 60s gap\n"
+            "🛡 <b>AEGIS SAFE MODE</b>\n\n"
+            "• Watchdog: <b>Active (V6.0 Stable)</b>\n"
+            "• Startup: Set Identity -> Inject -> Launch\n"
+            "• UI Refresh: Optimized for stability\n"
             "• Locking: Serialized startup active\n\n"
-            "Stable logic: No aggressive kills or background interference."
+            "<i>Stable logic: Clean kernel detection.</i>"
         )

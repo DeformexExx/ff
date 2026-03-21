@@ -8,6 +8,7 @@ import logging
 import time
 import tempfile
 import re
+import html
 from typing import Optional, Dict
 
 # ── ABSOLUTE PATH LOCK ─────────────────────────────────────────────────────
@@ -114,6 +115,19 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                     thr = int(m_thr.group(1)) if m_thr else 0
                     bot_instance.clone_states[f"{name}:threads"] = str(thr)
                     
+                    uptime = now - bot_instance.running_since.get(name, now)
+                    
+                    if uptime < 120:
+                        low_thread_strikes[name] = 0
+                        bot_instance.clone_states[f"{name}:status"] = "Starting Up"
+                        continue
+                        
+                    # V6.0 Logic: Anti-False Positive
+                    if thr >= 130:
+                        low_thread_strikes[name] = 0
+                        bot_instance.clone_states[f"{name}:status"] = "Stable"
+                        continue
+                        
                     # V6.0 Logic: Instant Death
                     if thr < 10:
                         reason = f"Instant Death (Thr:{thr}<10)"
@@ -144,10 +158,12 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                     admin = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
                     if admin:
                         try:
+                            n_esc = html.escape(name)
+                            r_esc = html.escape(reason)
                             await application.bot.send_message(
                                 admin,
-                                f"🐕 *Watchdog*: `{name}` → {reason}\n🧹 PURGE & RELAUNCH…",
-                                parse_mode="Markdown"
+                                f"🐕 <b>Watchdog</b>: <code>{n_esc}</code> → {r_esc}\n🧹 PURGE &amp; RELAUNCH…",
+                                parse_mode="HTML"
                             )
                         except TelegramError:
                             pass
@@ -208,9 +224,9 @@ class AegisBot:
             self.running_since[name] = time.time()
         elif old == CloneState.RUNNING:
             self.running_since.pop(name, None)
-        logger.info(f"State [{name}]: {old.value} → {state.value}")
+        logger.info(f"State [{name}]: {str(old)} → {str(state)}")
         if state in [CloneState.RUNNING, CloneState.STOPPED]:
-            self.config.update_clone_status(name, state.value)
+            self.config.update_clone_status(name, str(state))
 
     # ── Admin guard ───────────────────────────────────────────────────────
     async def _is_admin(self, uid: int) -> bool:
@@ -224,7 +240,7 @@ class AegisBot:
         await update.message.reply_text(
             UIManager.get_welcome_text(DEVICE_ID, VERSION),
             reply_markup=UIManager.get_main_keyboard(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
     async def cmd_console(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -237,7 +253,8 @@ class AegisBot:
                 tail = "".join(lines[-15:]).strip() or "(empty)"
             else:
                 tail = "(boot_log.txt not found)"
-            await update.message.reply_text(f"```\n{tail}\n```", parse_mode="Markdown")
+            tail_esc = html.escape(tail)
+            await update.message.reply_text(f"<pre>{tail_esc}</pre>", parse_mode="HTML")
         except Exception as e:
             await update.message.reply_text(f"❌ Console error: {e}")
 
@@ -264,11 +281,12 @@ class AegisBot:
                 await update.message.reply_document(f, filename="exec_output.txt")
             os.remove(path)
         else:
-            await update.message.reply_text(f"```bash\n{res}\n```", parse_mode="Markdown")
+            res_esc = html.escape(res)
+            await update.message.reply_text(f"<pre>{res_esc}</pre>", parse_mode="HTML")
 
     async def cmd_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update.effective_user.id): return
-        msg = await update.message.reply_text("🔄 *Hard Update Sequence Started...*", parse_mode="Markdown")
+        msg = await update.message.reply_text("🔄 <b>Hard Update Sequence Started...</b>", parse_mode="HTML")
         
         try:
             # 1. Hard Reset (V6.0 Robust)
@@ -288,7 +306,7 @@ class AegisBot:
                 await run_bash(f"pip install -r {req_path}")
 
             # 4. Feedback & Final Restart
-            await msg.edit_text("✅ *Файлы обновлены, кэш очищен. Перезагрузка...*", parse_mode="Markdown")
+            await msg.edit_text("✅ <b>Файлы обновлены, кэш очищен. Перезагрузка...</b>", parse_mode="HTML")
             await asyncio.sleep(2)
             
             # Re-exec process to apply changes immediately
@@ -298,13 +316,14 @@ class AegisBot:
             logger.error(f"Update Module Error: {e}")
             if msg:
                 try:
-                    await msg.edit_text(f"❌ *Update Failed*: `{e}`", parse_mode="Markdown")
+                    e_esc = html.escape(str(e))
+                    await msg.edit_text(f"❌ <b>Update Failed</b>: <code>{e_esc}</code>", parse_mode="HTML")
                 except Exception: pass
 
     async def cmd_mass_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update.effective_user.id): return
         chat = update.message.chat_id
-        await update.message.reply_text("🚀 *Mass Start Initiated*\n⏳ Clones launch sequentially (10s gap).", parse_mode="Markdown")
+        await update.message.reply_text("🚀 <b>Mass Start Initiated</b>\n⏳ Clones launch sequentially (10s gap).", parse_mode="HTML")
         asyncio.create_task(self._mass_start(chat))
 
     async def cmd_mass_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -312,7 +331,7 @@ class AegisBot:
         chat = update.message.chat_id
         for c in self.config.clones_data:
             asyncio.create_task(self._stop_clone(c.get("name"), chat))
-        await update.message.reply_text("❄️ *Mass Stop issued.*", parse_mode="Markdown")
+        await update.message.reply_text("❄️ <b>Mass Stop issued.</b>", parse_mode="HTML")
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update.effective_user.id): return
@@ -324,12 +343,13 @@ class AegisBot:
         elif self._waiting_for_timer: await self._handle_timer_input(update)
 
     async def _open_maintenance(self, update: Update):
+        m_state = 'ENABLED' if self.maintenance_enabled else 'DISABLED'
         await update.message.reply_text(
-            "🛠 *MAINTENANCE SETTINGS*\n"
-            f"Auto-Purge: `{'ENABLED' if self.maintenance_enabled else 'DISABLED'}`\n"
-            f"Interval: `{self.maintenance_minutes} min`",
+            "🛠 <b>MAINTENANCE SETTINGS</b>\n"
+            f"Auto-Purge: <code>{m_state}</code>\n"
+            f"Interval: <code>{self.maintenance_minutes} min</code>",
             reply_markup=UIManager.get_maintenance_keyboard(self.maintenance_enabled, self.maintenance_minutes),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
     async def _handle_timer_input(self, update: Update):
@@ -339,7 +359,7 @@ class AegisBot:
             if 5 <= mins <= 1440:
                 self.maintenance_minutes = mins
                 self._waiting_for_timer = False
-                await update.message.reply_text(f"✅ Timer set to `{mins}` minutes.", parse_mode="Markdown")
+                await update.message.reply_text(f"✅ Timer set to <code>{mins}</code> minutes.", parse_mode="HTML")
                 await self._open_maintenance(update)
             else:
                 await update.message.reply_text("❌ Please enter a value between 5 and 1440.")
@@ -351,14 +371,14 @@ class AegisBot:
         await update.message.reply_text(
             UIManager.format_dashboard(DEVICE_ID, ram, cpu, temp, VERSION),
             reply_markup=UIManager.get_device_keyboard(),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
     async def _open_system(self, update: Update):
         await update.message.reply_text(
-            "⚙️ *SYSTEM*",
+            "⚙️ <b>SYSTEM</b>",
             reply_markup=UIManager.get_system_keyboard(self._console_on, self.persistence.auto_restore),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
     async def open_clones_hub(self, update: Update):
@@ -366,13 +386,13 @@ class AegisBot:
             self.config.reload()
             text = self._build_hub_text()
             kb   = UIManager.get_clones_hub_keyboard(self.config.clones_data)
-            self._dash_msg = await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+            self._dash_msg = await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
         except Exception as e:
             logger.error(f"open_clones_hub error: {e}")
             await update.message.reply_text(f"❌ Hub error: {e}")
 
     def _build_hub_text(self) -> str:
-        state_map  = {n: s.value for n, s in self.clone_states.items()}
+        state_map  = {n: str(s) for n, s in self.clone_states.items()}
         return UIManager.format_clones_hub(self.config.clones_data, state_map, VERSION)
 
     async def refresh_dashboard(self, force=False):
@@ -385,7 +405,7 @@ class AegisBot:
         try:
             text = self._build_hub_text()
             kb   = UIManager.get_clones_hub_keyboard(self.config.clones_data)
-            await self._dash_msg.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+            await self._dash_msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
             self._last_ui_update = now
         except Exception:
             pass
@@ -402,7 +422,7 @@ class AegisBot:
         try:
             if d == "nav_home":
                 await q.message.reply_text(UIManager.get_welcome_text(DEVICE_ID, VERSION),
-                                           reply_markup=UIManager.get_main_keyboard(), parse_mode="Markdown")
+                                           reply_markup=UIManager.get_main_keyboard(), parse_mode="HTML")
 
             elif d == "toggle_restore":
                 self.persistence.auto_restore = not self.persistence.auto_restore
@@ -421,7 +441,7 @@ class AegisBot:
 
             elif d == "sys_sync":  await self._git_sync(chat)
             elif d == "sys_screenshot": await self._take_screenshot(q.message)
-            elif d == "sys_help": await q.message.reply_text(UIManager.get_help_text(), parse_mode="Markdown")
+            elif d == "sys_help": await q.message.reply_text(UIManager.get_help_text(), parse_mode="HTML")
 
             elif d.startswith("start_"):
                 name = d[6:]
@@ -437,13 +457,14 @@ class AegisBot:
                 name  = d[6:]
                 # V5.3 Hotfix: Robust state extraction
                 raw_state = self.clone_states.get(name, CloneState.STOPPED)
-                state_val = str(raw_state.value if hasattr(raw_state, 'value') else raw_state)
+                state_val = str(raw_state)
                 
+                s_val_esc = html.escape(state_val)
                 kb    = UIManager.get_clone_submenu(name, state_val)
                 await context.bot.send_message(
                     chat,
-                    f"⚙️ *{name.upper()}*\nState: `{state_val}`",
-                    reply_markup=kb, parse_mode="Markdown"
+                    f"⚙️ <b>{name.upper()}</b>\nState: <code>{s_val_esc}</code>",
+                    reply_markup=kb, parse_mode="HTML"
                 )
 
             elif d == "maint_toggle":
@@ -455,7 +476,7 @@ class AegisBot:
 
             elif d == "maint_set_timer":
                 self._waiting_for_timer = True
-                await q.message.reply_text("⏱ *SET TIMER*\nSend the maintenance interval in minutes (e.g., `60`).", parse_mode="Markdown")
+                await q.message.reply_text("⏱ <b>SET TIMER</b>\nSend the maintenance interval in minutes (e.g., <code>60</code>).", parse_mode="HTML")
 
             elif d == "maint_run_now":
                 if self._maint_in_progress:
@@ -501,8 +522,9 @@ class AegisBot:
                 app = self.application
                 if chat_id and app:
                     try:
+                        n_esc = html.escape(name)
                         await app.bot.send_message(
-                            chat_id, f"👁 `{name}`: Process detected. Attaching...", parse_mode="Markdown")
+                            chat_id, f"👁 <code>{n_esc}</code>: Process detected. Attaching...", parse_mode="HTML")
                     except Exception: pass
                 return
 
@@ -510,10 +532,15 @@ class AegisBot:
             app = self.application
             if chat_id and app:
                 try:
+                    n_esc = html.escape(name)
                     sm = await app.bot.send_message(
-                        chat_id, f"🚀 `{name}`: Запуск...", parse_mode="Markdown")
+                        chat_id, f"🚀 <code>{n_esc}</code>: Запуск...", parse_mode="HTML")
                 except Exception:
                     pass
+
+            # V6.0 Explicit Cache Wipe before start
+            suffix = name[-1].lower() if name.startswith("clien") else name.lower()
+            await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
 
             # V5.0 Sequence: Cookie -> Launch only
             urls = self.config.servers_list
@@ -526,8 +553,8 @@ class AegisBot:
             else:
                 self.set_state(name, CloneState.STOPPED)
 
-            # Global 20s stagger delay between starts to avoid CPU spikes
-            await asyncio.sleep(20)
+            # Global 10s stagger delay between starts to avoid CPU spikes
+            await asyncio.sleep(10)
 
         await self.refresh_dashboard(force=True)
 
@@ -538,7 +565,7 @@ class AegisBot:
         app = self.application
         if chat_id and app:
             try:
-                await app.bot.send_message(chat_id, "🧹 *Очистка кэша перед массовым стартом...*", parse_mode="Markdown")
+                await app.bot.send_message(chat_id, "🧹 <b>Очистка кэша перед массовым стартом...</b>", parse_mode="HTML")
             except Exception: pass
             
         for c in clones:
@@ -554,15 +581,12 @@ class AegisBot:
                 try:
                     await app.bot.send_message(
                         chat_id,
-                        f"🚀 *Queue [{idx}/{len(clones)}]*: `{name}`",
-                        parse_mode="Markdown"
+                        f"🚀 <b>Queue [{idx}/{len(clones)}]</b>: <code>{html.escape(name)}</code>",
+                        parse_mode="HTML"
                     )
                 except Exception:
                     pass
             await self._enqueue_start(name, chat_id)
-            # 10s gap between each clone
-            if idx < len(clones):
-                await asyncio.sleep(10)
 
     async def _stop_clone(self, name: Optional[str], chat_id):
         if not name: return
@@ -573,7 +597,7 @@ class AegisBot:
         if chat_id and app:
             try:
                 await app.bot.send_message(
-                    chat_id, f"🌑 `{name}` stopped.", parse_mode="Markdown")
+                    chat_id, f"🌑 <code>{html.escape(name)}</code> stopped.", parse_mode="HTML")
             except Exception:
                 pass
         await self.refresh_dashboard(force=True)
@@ -710,7 +734,7 @@ class AegisBot:
             
             if chat_id and self.application:
                 await self.application.bot.send_message(
-                    chat_id, "✅ *Hard Update Complete*. Purged __pycache__. Rebooting...", parse_mode="Markdown")
+                    chat_id, "✅ <b>Hard Update Complete</b>. Purged __pycache__. Rebooting...", parse_mode="HTML")
             
             await asyncio.sleep(2)
             os.execv(sys.executable, ['python'] + sys.argv)
@@ -729,10 +753,10 @@ class AegisBot:
         async def notify(text):
             if target_chat and self.application:
                 try:
-                    await self.application.bot.send_message(target_chat, text, parse_mode="Markdown")
+                    await self.application.bot.send_message(target_chat, text, parse_mode="HTML")
                 except Exception: pass
 
-        await notify("🔄 *Starting scheduled maintenance...*\n`[THE PURGE]`")
+        await notify("🔄 <b>Starting scheduled maintenance...</b>\n<code>[THE PURGE]</code>")
         logger.warning("Maintenance: Starting purge cycle.")
 
         # 1. Kill all clones
@@ -747,7 +771,8 @@ class AegisBot:
 
         # 3. Restart active clones (b, c, e, f, g, i)
         active_sequence = ["clienb", "clienc", "cliene", "clienf", "clieng", "clieni"]
-        await notify(f"🚀 Restarting sequence: `{', '.join(active_sequence)}`")
+        seq_str = ", ".join(active_sequence)
+        await notify(f"🚀 Restarting sequence: <code>{html.escape(seq_str)}</code>")
 
         for idx, name in enumerate(active_sequence):
             # We don't use _enqueue_start directly because we want 15s stagger
@@ -757,7 +782,7 @@ class AegisBot:
             if idx < len(active_sequence) - 1:
                 await asyncio.sleep(15)
 
-        await notify("✅ *Maintenance Cycle Complete.*")
+        await notify("✅ <b>Maintenance Cycle Complete.</b>")
         self._maint_in_progress = False
 
     async def _maint_timer_loop(self):
@@ -787,8 +812,9 @@ class AegisBot:
         admin_id = self.config.admin_ids[0] if self.config.admin_ids else None
         if admin_id:
             try:
+                err_esc = html.escape(str(context.error))
                 await context.bot.send_message(
-                    admin_id, f"🚨 *Global Error*\n`{context.error}`", parse_mode="Markdown")
+                    admin_id, f"🚨 <b>Global Error</b>\n<code>{err_esc}</code>", parse_mode="HTML")
             except Exception:
                 pass
 
