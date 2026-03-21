@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import logging
+from typing import Optional
 from bash_utils import run_bash
 
 logger = logging.getLogger("MonitorEngine")
@@ -33,42 +34,58 @@ class MonitorEngine:
         return ram, cpu, temp
 
     @staticmethod
+    async def get_pid(suffix: str) -> Optional[str]:
+        """
+        V6.0 Final: Strict PID discovery via ps -A | grep | awk chain.
+        Returns first PID or None.
+        """
+        cmd = f"su -c \"ps -A | grep com.roblox.clien{suffix} | grep -v grep | awk '{{print $2}}'\""
+        _, stdout, _ = await run_bash(cmd)
+        
+        raw = stdout.strip()
+        if not raw or any(err in raw.lower() for err in ["rooting", "no such", "denied", "found"]):
+            return None
+            
+        pids = raw.split('\n')
+        first_pid = pids[0].strip()
+        return first_pid if first_pid.isdigit() else None
+
+    @staticmethod
+    async def get_threads(pid: str) -> int:
+        """
+        V6.0 Final: Accurate thread count via /proc/{pid}/task.
+        Returns 0 on any failure.
+        """
+        if not pid or not str(pid).isdigit():
+            return 0
+            
+        cmd = f"su -c \"ls /proc/{pid}/task | wc -l\""
+        _, stdout, _ = await run_bash(cmd)
+        
+        raw = stdout.strip()
+        if not raw or any(err in raw.lower() for err in ["rooting", "no such", "denied"]):
+            return 0
+            
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
+
+    @staticmethod
     async def get_clone_status(clone_name: str) -> str:
         """
         V6.0 Stable: Advanced root-level monitoring via /proc FS.
         """
-        # Suffix extracion: clienb -> b, clienc -> c
         suffix = clone_name[-1] if clone_name.startswith("clien") else clone_name
+        pid = await MonitorEngine.get_pid(suffix)
         
-        # 1. PID Discovery (V6.0 confirmed awk chain)
-        cmd_pid = f"su -c \"ps -A | grep com.roblox.clien{suffix} | grep -v grep | awk '{{print $2}}'\""
-        ret, stdout_pid, _ = await run_bash(cmd_pid)
-        
-        # Robust validation: check for error strings or multiple lines
-        raw_pid = stdout_pid.strip()
-        if any(err in raw_pid for err in ["rooting", "No such", "denied", "found"]):
-            return "Offline"
-            
-        pid = raw_pid.split('\n')[0] if raw_pid else ""
-        if not pid or not pid.isdigit():
+        if not pid:
             return "Offline"
 
         try:
-            # 2. Thread Counting (V6.0 Kernel confirmed)
-            cmd_thr = f"su -c \"ls /proc/{pid}/task | wc -l\""
-            _, stdout_thr, _ = await run_bash(cmd_thr)
+            threads = await MonitorEngine.get_threads(pid)
             
-            raw_thr = stdout_thr.strip()
-            if any(err in raw_thr for err in ["rooting", "No such", "denied"]) or not raw_thr:
-                threads = 0
-            else:
-                try:
-                    threads = int(raw_thr)
-                except ValueError:
-                    threads = 0
-
-            # 3. Memory & CPU (Still useful for UI, but subordinated to new discovery)
-            # We use the discovered PID to get VmRSS if it still exists
+            # Memory check (VmRSS)
             cmd_st = f"su -c \"cat /proc/{pid}/status | grep VmRSS\""
             _, stdout_st, _ = await run_bash(cmd_st)
             

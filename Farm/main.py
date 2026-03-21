@@ -128,17 +128,15 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                         bot_instance.clone_states[f"{name}:status"] = "Stable"
                         continue
                         
-                    # V6.0 Logic: Instant Death
-                    if thr < 10:
-                        reason = f"Instant Death (Thr:{thr}<10)"
+                    # V6.0 Final Logic
+                    if thr == 0:
+                        reason       = "Dead (Threads: 0)"
                         needs_action = True
-                    
-                    # V6.0 Logic: 3-Minute Rule (6 strikes at 30s)
-                    elif thr < 130:
+                    elif 0 < thr < 130:
                         low_thread_strikes[name] = low_thread_strikes.get(name, 0) + 1
                         logger.info(f"[{name.upper()}] Low threads: {thr}. Strike {low_thread_strikes[name]}/6.")
                         if low_thread_strikes[name] >= 6:
-                            reason = f"3-Min Fail (Thr:{thr}<130)"
+                            reason       = f"Freeze (Thr:{thr}<130 for 3m)"
                             needs_action = True
                     else:
                         low_thread_strikes[name] = 0
@@ -158,8 +156,8 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                     admin = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
                     if admin:
                         try:
-                            n_esc = html.escape(name)
-                            r_esc = html.escape(reason)
+                            n_esc = html.escape(name.replace('_', '-'))
+                            r_esc = html.escape(reason.replace('_', '-'))
                             await application.bot.send_message(
                                 admin,
                                 f"🐕 <b>Watchdog</b>: <code>{n_esc}</code> → {r_esc}\n🧹 PURGE &amp; RELAUNCH…",
@@ -259,9 +257,10 @@ class AegisBot:
             await update.message.reply_text(f"❌ Console error: {e}")
 
     async def _purge_restart(self, name: str, chat_id):
-        await run_bash(f"su -c 'am force-stop com.roblox.{name}'")
-        await run_bash(f"su -c 'rm -rf /data/data/com.roblox.{name}/cache/*'")
-        await run_bash(f"su -c 'rm -rf /data/data/com.roblox.{name}/code_cache/*'")
+        suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
+        await run_bash(f"su -c 'am force-stop com.roblox.clien{suffix}'")
+        await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
+        await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/code_cache/*'")
         await self._enqueue_start(name, chat_id)
 
     async def cmd_exec(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -392,18 +391,33 @@ class AegisBot:
             await update.message.reply_text(f"❌ Hub error: {e}")
 
     async def _build_hub_text(self) -> str:
+        tasks = []
         for c in self.config.clones_data:
             name = c.get("name")
             if not name: continue
-            raw_s = self.clone_states.get(name, CloneState.STOPPED)
-            state = str(raw_s).upper()
-            if state == "RUNNING":
-                st = await MonitorEngine.get_clone_status(name)
-                m_thr = re.search(r"Thr:\s*(\d+)", st)
-                thr = int(m_thr.group(1)) if m_thr else 0
-                self.clone_states[f"{name}:threads"] = str(thr)
+            
+            suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
+            
+            async def update_clone_stats(n, sfx):
+                pid = await MonitorEngine.get_pid(sfx)
+                thr = await MonitorEngine.get_threads(pid) if pid else 0
+                self.clone_states[f"{n}:threads"] = str(thr)
+                
+            tasks.append(update_clone_stats(name, suffix))
+            
+        if tasks:
+            await asyncio.gather(*tasks)
 
-        state_map  = {n: str(s) for n, s in self.clone_states.items()}
+        state_map = {}
+        for n, s in self.clone_states.items():
+            # Preserving ':' for status/threads mapping while sanitizing names
+            if ":" in n:
+                name_part, key_part = n.split(":", 1)
+                clean_n = f"{name_part.replace('_', '-')}:{key_part}"
+            else:
+                clean_n = n.replace('_', '-')
+            state_map[clean_n] = str(s)
+            
         return UIManager.format_clones_hub(self.config.clones_data, state_map, VERSION)
 
     async def refresh_dashboard(self, force=False):
@@ -473,8 +487,7 @@ class AegisBot:
                 await self._take_screenshot(q.message)
 
             elif d.startswith("clone_"):
-                name  = d[6:]
-                # V5.3 Hotfix: Robust state extraction
+                name_esc  = html.escape(name.replace('_', '-'))
                 raw_state = self.clone_states.get(name, CloneState.STOPPED)
                 state_val = str(raw_state)
                 
@@ -482,7 +495,7 @@ class AegisBot:
                 kb    = UIManager.get_clone_submenu(name, state_val)
                 await context.bot.send_message(
                     chat,
-                    f"⚙️ <b>{name.upper()}</b>\nState: <code>{s_val_esc}</code>",
+                    f"⚙️ <b>{name_esc.upper()}</b>\nState: <code>{s_val_esc}</code>",
                     reply_markup=kb, parse_mode="HTML"
                 )
 
@@ -551,9 +564,9 @@ class AegisBot:
             app = self.application
             if chat_id and app:
                 try:
-                    n_esc = html.escape(name)
+                    name_esc = html.escape(name.replace('_', '-'))
                     sm = await app.bot.send_message(
-                        chat_id, f"🚀 <code>{n_esc}</code>: Запуск...", parse_mode="HTML")
+                        chat_id, f"🚀 <code>{name_esc}</code>: Запуск...", parse_mode="HTML")
                 except Exception:
                     pass
 
@@ -602,7 +615,7 @@ class AegisBot:
                 if not name: continue
                 await app.bot.send_message(
                     chat_id,
-                    f"🚀 <b>Queue [{idx}/{len(clones)}]</b>: <code>{html.escape(name)}</code>",
+                    f"🚀 <b>Queue [{idx}/{len(clones)}]</b>: <code>{html.escape(name.replace('_', '-'))}</code>",
                     parse_mode="HTML"
                 )
                 await self._enqueue_start(name, chat_id)
@@ -641,7 +654,7 @@ class AegisBot:
         if chat_id and app:
             try:
                 await app.bot.send_message(
-                    chat_id, f"🌑 <code>{html.escape(name)}</code> stopped.", parse_mode="HTML")
+                    chat_id, f"🌑 <code>{html.escape(name.replace('_', '-'))}</code> stopped.", parse_mode="HTML")
             except Exception:
                 pass
         await self.refresh_dashboard(force=True)

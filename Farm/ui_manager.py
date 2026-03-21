@@ -21,7 +21,7 @@ class UIManager:
     # ── WELCOME ───────────────────────────────────────────────────────────
     @staticmethod
     def get_welcome_text(device_id: str, version: str) -> str:
-        d_esc = html.escape(device_id)
+        d_esc = html.escape(device_id.replace('_', '-'))
         v_esc = html.escape(version)
         return (
             f"💎 <b>AEGIS V{v_esc} — DIAMOND CUT</b>\n"
@@ -41,7 +41,7 @@ class UIManager:
 
     @staticmethod
     def format_dashboard(device_id: str, ram: str, cpu: str, temp: str, version: str) -> str:
-        d_esc = html.escape(device_id)
+        d_esc = html.escape(device_id.replace('_', '-'))
         v_esc = html.escape(version)
         r_esc = html.escape(ram)
         c_esc = html.escape(cpu)
@@ -101,25 +101,22 @@ class UIManager:
 
         # Compact Tabular format
         for clone in clones_data:
-            name  = clone.get("name", "Unknown").replace('_', ' ')
-            # Bugfix: Handle Hub Error explicitly
-            raw_s = state_map.get(name, "STOPPED")
+            name  = clone.get("name", "Unknown").replace('_', '-')
+            raw_s = state_map.get(name.replace('-', '_'), "STOPPED")
             state = str(raw_s).upper()
             
-            icon = "🔴"
-            status_text = "Offline"
-                
-            suffix = name[-1].upper() if name.startswith("clien") else name.upper()
+            # Suffix logic: clienb -> B
+            suffix = name[-1].upper() if name.lower().startswith("clien") else name.upper()
 
-            # Thread info
+            # Thread info (name already has '-' instead of '_')
             thr_info = str(state_map.get(f"{name}:threads", "0"))
             
             # Account info
             active_acc = clone.get("account")
             if not active_acc:
-                active_acc = "Нет аккаунта"
+                active_acc = "Нет-аккаунта"
             else:
-                active_acc = active_acc.replace('_', ' ')
+                active_acc = active_acc.replace('_', '-')
             
             acc_esc = html.escape(active_acc)
             thr_esc = html.escape(thr_info)
@@ -132,7 +129,7 @@ class UIManager:
 
             if state == "STARTING":
                 msg += f"⏳ {suffix} | Loading....\n"
-            elif state == "RUNNING" and thr_val >= 10:
+            elif thr_val > 10:
                 msg += f"🟢 {suffix} | {thr_esc} th | Актив: {acc_esc}\n"
             else:
                 msg += f"🔴 {suffix} | Offline\n"
@@ -150,7 +147,7 @@ class UIManager:
         names = [c.get("name", "?") for c in clones_data]
         for i in range(0, len(names), 2):
             row = [
-                InlineKeyboardButton(f"⚙️ {n.upper()}", callback_data=f"clone_{n}")
+                InlineKeyboardButton(f"⚙️ {n.upper().replace('_', '-')}", callback_data=f"clone_{n}")
                 for n in names[i:i+2]
             ]
             rows.append(row)
