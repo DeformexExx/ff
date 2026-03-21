@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Aegis bot — V8.8
+# Aegis bot — V9.0
 import os
 import sys
 import enum
@@ -16,6 +16,43 @@ _bot_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(_bot_dir)
 sys.path.insert(0, _bot_dir)
 
+# ── IMMORTALITY: apply before anything else ──────────────────────────────────
+def apply_immortality() -> None:
+    """Anti-OOM: oom_score_adj=-1000, nice=-20, termux-wake-lock."""
+    pid = os.getpid()
+    # oom_score_adj: kernel will never OOM-kill this process
+    try:
+        subprocess.run(
+            ["su", "-c", f"echo -1000 > /proc/{pid}/oom_score_adj"],
+            capture_output=True, timeout=15,
+        )
+    except Exception:
+        pass
+    # Highest scheduling priority
+    try:
+        os.nice(-20)
+    except Exception:
+        pass
+    # Termux wake lock — prevent CPU sleep
+    for wl in ["termux-wake-lock",
+                "/data/data/com.termux/files/usr/bin/termux-wake-lock"]:
+        try:
+            subprocess.run([wl], capture_output=True, timeout=20)
+            break
+        except Exception:
+            pass
+
+# Apply immortality immediately at startup (before logging / arg parsing)
+apply_immortality()
+
+if len(sys.argv) < 2:
+    print("❌  Usage: python main.py <DEVICE_ID>")
+    sys.exit(1)
+
+DEVICE_ID = sys.argv[1]
+FARM_DIR  = _bot_dir
+BOOT_LOG  = os.path.join(FARM_DIR, "boot_log.txt")
+
 from telegram import Update, Message
 from telegram.ext import (
     ApplicationBuilder, Application, CommandHandler,
@@ -30,42 +67,7 @@ from injection_engine    import InjectionEngine
 from bash_utils          import run_bash
 from persistence_manager import PersistenceManager
 
-VERSION = "8.8"
-
-
-def apply_immortality() -> None:
-    """Anti-OOM: oom_score_adj, nice, termux-wake-lock (subprocess)."""
-    pid = os.getpid()
-    try:
-        subprocess.run(
-            ["su", "-c", f"echo -1000 > /proc/{pid}/oom_score_adj"],
-            capture_output=True,
-            timeout=15,
-        )
-    except Exception as e:
-        logger.warning(f"oom_score_adj: {e}")
-    try:
-        os.nice(-20)
-    except Exception as e:
-        logger.warning(f"nice(-20): {e}")
-    try:
-        subprocess.run(["termux-wake-lock"], capture_output=True, timeout=20)
-    except (FileNotFoundError, subprocess.SubprocessError) as e:
-        logger.debug(f"termux-wake-lock: {e}")
-    tw = "/data/data/com.termux/files/usr/bin/termux-wake-lock"
-    if os.path.isfile(tw):
-        try:
-            subprocess.run([tw], capture_output=True, timeout=20)
-        except subprocess.SubprocessError as e:
-            logger.debug(f"wake-lock path: {e}")
-
-if len(sys.argv) < 2:
-    print("❌  Usage: python main.py <DEVICE_ID>")
-    sys.exit(1)
-
-DEVICE_ID = sys.argv[1]
-FARM_DIR  = _bot_dir
-BOOT_LOG  = os.path.join(FARM_DIR, "boot_log.txt")
+VERSION = "9.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,7 +77,7 @@ logging.basicConfig(
         logging.FileHandler(BOOT_LOG, encoding="utf-8"),
     ]
 )
-logger = logging.getLogger("AegisV40")
+logger = logging.getLogger("AegisV90")
 for _quiet in ("httpx", "httpcore", "telegram", "telegram.ext", "telegram.request"):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
@@ -829,7 +831,7 @@ class AegisBot:
 
     async def run(self):
         logger.info(f"Aegis V{VERSION} start — {DEVICE_ID}")
-        apply_immortality()
+        # immortality already applied at module level before arg parsing
 
         self.application = ApplicationBuilder().token(self.config.bot_token).build()
         app = self.application

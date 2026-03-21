@@ -104,15 +104,25 @@ class UIManager:
             if not raw_name:
                 continue
             name_disp = raw_name.replace("_", "-")
+            nick = (clone.get("nickname") or raw_name).replace("_", "-")
+            # Keep nick short to fit button (max ~10 chars)
+            nick_short = nick[:10] if len(nick) > 10 else nick
             healthy = state_map.get(f"{name_disp}:healthy", "0") == "1"
             state = str(state_map.get(name_disp, "STOPPED")).upper()
             letter = _clone_letter(raw_name)
             emoji = _hub_emoji(state, healthy)
-            label = f"{emoji} {letter}"
+            thr_raw = state_map.get(f"{name_disp}:threads", "0")
+            cpu_raw = state_map.get(f"{name_disp}:cpu", "—")
+            try:
+                thr_val = int(thr_raw)
+            except (ValueError, TypeError):
+                thr_val = 0
+            # Format: [B] 🟢 Nick | 145th | 20% CPU
+            label = f"[{letter}] {emoji} {nick_short} | {thr_val}th | {cpu_raw}%"
             chunk.append(
                 InlineKeyboardButton(label, callback_data=f"clone_{raw_name}")
             )
-            if len(chunk) >= 3:
+            if len(chunk) >= 4:
                 rows.append(chunk)
                 chunk = []
         if chunk:
