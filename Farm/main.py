@@ -120,11 +120,11 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                         needs_action = True
                     
                     # V6.0 Logic: 3-Minute Rule (6 strikes at 30s)
-                    elif thr < 110:
+                    elif thr < 130:
                         low_thread_strikes[name] = low_thread_strikes.get(name, 0) + 1
                         logger.info(f"[{name.upper()}] Low threads: {thr}. Strike {low_thread_strikes[name]}/6.")
                         if low_thread_strikes[name] >= 6:
-                            reason = f"3-Min Fail (Thr:{thr}<110)"
+                            reason = f"3-Min Fail (Thr:{thr}<130)"
                             needs_action = True
                     else:
                         low_thread_strikes[name] = 0
@@ -222,7 +222,7 @@ class AegisBot:
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update.effective_user.id): return
         await update.message.reply_text(
-            UIManager.get_welcome_text(DEVICE_ID),
+            UIManager.get_welcome_text(DEVICE_ID, VERSION),
             reply_markup=UIManager.get_main_keyboard(),
             parse_mode="Markdown"
         )
@@ -301,6 +301,19 @@ class AegisBot:
                     await msg.edit_text(f"❌ *Update Failed*: `{e}`", parse_mode="Markdown")
                 except Exception: pass
 
+    async def cmd_mass_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._is_admin(update.effective_user.id): return
+        chat = update.message.chat_id
+        await update.message.reply_text("🚀 *Mass Start Initiated*\n⏳ Clones launch sequentially (10s gap).", parse_mode="Markdown")
+        asyncio.create_task(self._mass_start(chat))
+
+    async def cmd_mass_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._is_admin(update.effective_user.id): return
+        chat = update.message.chat_id
+        for c in self.config.clones_data:
+            asyncio.create_task(self._stop_clone(c.get("name"), chat))
+        await update.message.reply_text("❄️ *Mass Stop issued.*", parse_mode="Markdown")
+
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update.effective_user.id): return
         t = update.message.text
@@ -336,7 +349,7 @@ class AegisBot:
     async def _open_device(self, update: Update):
         ram, cpu, temp = await MonitorEngine.get_system_stats()
         await update.message.reply_text(
-            UIManager.format_dashboard(DEVICE_ID, ram, cpu, temp),
+            UIManager.format_dashboard(DEVICE_ID, ram, cpu, temp, VERSION),
             reply_markup=UIManager.get_device_keyboard(),
             parse_mode="Markdown"
         )
@@ -360,7 +373,7 @@ class AegisBot:
 
     def _build_hub_text(self) -> str:
         state_map  = {n: s.value for n, s in self.clone_states.items()}
-        return UIManager.format_clones_hub(self.config.clones_data, state_map, self.running_since)
+        return UIManager.format_clones_hub(self.config.clones_data, state_map, VERSION)
 
     async def refresh_dashboard(self, force=False):
         if not self._dash_msg: return
@@ -388,7 +401,7 @@ class AegisBot:
         chat = q.message.chat_id
         try:
             if d == "nav_home":
-                await q.message.reply_text(UIManager.get_welcome_text(DEVICE_ID),
+                await q.message.reply_text(UIManager.get_welcome_text(DEVICE_ID, VERSION),
                                            reply_markup=UIManager.get_main_keyboard(), parse_mode="Markdown")
 
             elif d == "toggle_restore":
@@ -409,19 +422,6 @@ class AegisBot:
             elif d == "sys_sync":  await self._git_sync(chat)
             elif d == "sys_screenshot": await self._take_screenshot(q.message)
             elif d == "sys_help": await q.message.reply_text(UIManager.get_help_text(), parse_mode="Markdown")
-
-            elif d == "mass_start":
-                await context.bot.send_message(
-                    chat,
-                    "🚀 *Startup Queue Active*\n⏳ Clones launch sequentially (60s gap).",
-                    parse_mode="Markdown"
-                )
-                asyncio.create_task(self._mass_start(chat))
-
-            elif d == "mass_stop":
-                for c in self.config.clones_data:
-                    asyncio.create_task(self._stop_clone(c.get("name"), chat))
-                await context.bot.send_message(chat, "❄️ Mass Stop issued.")
 
             elif d.startswith("start_"):
                 name = d[6:]
@@ -534,10 +534,22 @@ class AegisBot:
     async def _mass_start(self, chat_id):
         """Sequential mass start via the _start_lock queue."""
         clones = self.config.clones_data
+        
+        app = self.application
+        if chat_id and app:
+            try:
+                await app.bot.send_message(chat_id, "🧹 *Очистка кэша перед массовым стартом...*", parse_mode="Markdown")
+            except Exception: pass
+            
+        for c in clones:
+            name = c.get("name")
+            if name:
+                suffix = name[-1].lower() if name.startswith("clien") else name.lower()
+                await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
+                
         for idx, c in enumerate(clones, 1):
             name = c.get("name")
             if not name: continue
-            app = self.application
             if chat_id and app:
                 try:
                     await app.bot.send_message(
@@ -548,9 +560,9 @@ class AegisBot:
                 except Exception:
                     pass
             await self._enqueue_start(name, chat_id)
-            # 60s gap between each clone (inside lock releases)
+            # 10s gap between each clone
             if idx < len(clones):
-                await asyncio.sleep(60)
+                await asyncio.sleep(10)
 
     async def _stop_clone(self, name: Optional[str], chat_id):
         if not name: return
@@ -797,6 +809,8 @@ class AegisBot:
         app.add_handler(CommandHandler("console", self.cmd_console))
         app.add_handler(CommandHandler("exec",    self.cmd_exec))
         app.add_handler(CommandHandler("update",  self.cmd_update))
+        app.add_handler(CommandHandler("mass_start",  self.cmd_mass_start))
+        app.add_handler(CommandHandler("mass_stop",   self.cmd_mass_stop))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
         app.add_handler(CallbackQueryHandler(self.handle_callback))
         app.add_error_handler(self.error_handler)

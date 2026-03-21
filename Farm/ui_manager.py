@@ -21,9 +21,9 @@ class UIManager:
 
     # ── WELCOME ───────────────────────────────────────────────────────────
     @staticmethod
-    def get_welcome_text(device_id: str) -> str:
+    def get_welcome_text(device_id: str, version: str) -> str:
         return (
-            "💎 *AEGIS OVERLORD V6.0*\n"
+            f"💎 *AEGIS OVERLORD {version}*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"⚡️ SYSTEM : `[💠 ONLINE (SAFE)]`\n"
             f"📱 DEVICE : `{device_id}`\n"
@@ -39,28 +39,14 @@ class UIManager:
         ], resize_keyboard=True)
 
     @staticmethod
-    def _make_bar(percent_str: str, length: int = 10) -> str:
-        try:
-            val = float(percent_str.replace('%', ''))
-            filled = int(round((val / 100.0) * length))
-            filled = max(0, min(length, filled))
-            return '▰' * filled + '▱' * (length - filled)
-        except:
-            return '▱' * length
-
-    @staticmethod
-    def format_dashboard(device_id: str, ram: str, cpu: str, temp: str) -> str:
-        ram_bar = UIManager._make_bar(ram)
-        cpu_bar = UIManager._make_bar(cpu)
+    def format_dashboard(device_id: str, ram: str, cpu: str, temp: str, version: str) -> str:
         return (
-            "💎 *AEGIS V6.0 — STABLE*\n"
+            f"💎 *AEGIS {version}*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"📱 DEVICE  : `{device_id}`\n"
             f"🐕 WATCHDOG: `[DEEP MONITOR 🔒]`\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🧠 RAM: `[{ram_bar}]` {ram}\n"
-            f"🚀 CPU: `[{cpu_bar}]` {cpu}\n"
-            f"🌡 TEMP: `{temp}`\n"
+            f"🧠 RAM: {ram} | 🚀 CPU: {cpu} | 🌡 TEMP: {temp}\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "✨ _Advanced Telemetry Active_"
         )
@@ -68,7 +54,6 @@ class UIManager:
     @staticmethod
     def get_device_keyboard() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("♻️ GIT SYNC",   callback_data="sys_sync")],
             [InlineKeyboardButton("🖼 SCREENSHOT", callback_data="sys_screenshot")],
             [InlineKeyboardButton("🏠 BACK",       callback_data="nav_home")],
         ])
@@ -81,7 +66,6 @@ class UIManager:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton(f"📟 CONSOLE: {c}",      callback_data="toggle_console")],
             [InlineKeyboardButton(f"🔄 AUTO-RESTORE: {r}", callback_data="toggle_restore")],
-            [InlineKeyboardButton("❓ HELP",                callback_data="sys_help")],
             [InlineKeyboardButton("🏠 BACK",               callback_data="nav_home")],
         ])
 
@@ -97,56 +81,49 @@ class UIManager:
 
     # ── CLONE HUB TEXT — V5.2 Liquid Glass Card ─────────────────────────
     @staticmethod
-    def format_clones_hub(clones_data: list, state_map: dict, uptime_map: dict) -> str:
+    def format_clones_hub(clones_data: list, state_map: dict, version: str) -> str:
         """
         state_map:  {clone_name: CloneState (str value)}
-        uptime_map: {clone_name: start_timestamp (float) or None}
         """
-        msg = "💎 *AEGIS OVERLORD V6.0*\n"
+        msg = f"💎 *AEGIS OVERLORD {version}*\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
         if not clones_data:
             msg += "_No clones configured._"
             return msg
 
-        import time as _time
-
-        STATE_ICONS = {
-            "STOPPED":  "🌑 STOPPED",
-            "STARTING": "⏳ STARTING",
-            "RUNNING":  "🟢 RUNNING",
-        }
-
+        # Compact Tabular format
         for clone in clones_data:
             name  = clone.get("name", "Unknown")
+            # Bugfix: Handle Hub Error explicitly
             raw_s = state_map.get(name, "STOPPED")
             state = str(raw_s.value if hasattr(raw_s, 'value') else raw_s).upper()
-            icon  = STATE_ICONS.get(state, "❓ UNKNOWN")
-
-            # Uptime
-            ts = uptime_map.get(name)
-            if state == "RUNNING" and ts:
-                uptime = _fmt_uptime(_time.time() - ts)
-            else:
-                uptime = "—"
+            
+            icon = "🔴"
+            status_text = "Offline"
+            if state == "RUNNING":
+                icon = "🟢"
+                status_text = "Active"
+            elif state == "STARTING":
+                icon = "🟡"
+                status_text = "Injecting"
+                
+            suffix = name[-1].upper() if name.startswith("clien") else name.upper()
 
             # Thread info
-            thr_info = state_map.get(f"{name}:threads", "")
-            thr_line = f"🧵 Threads: `{thr_info}`" if thr_info else "🧵 Threads: `—`"
+            thr_info = state_map.get(f"{name}:threads", "0")
             
-            # Status badge
-            status_text = state_map.get(f"{name}:status", "Stable")
-            if state == "STOPPED":
-                status_text = "Offline"
-            elif state == "STARTING":
-                status_text = "Injecting"
+            # Additional info
+            active_acc = clone.get("username", clone.get("cookie", "None")[:6])
+            if active_acc != "None":
+                active_acc = f"ID:{active_acc}"
 
-            msg += (
-                f"[🎮 *{name.upper()}*]\n"
-                f"State: {icon} | 📊 {status_text}\n"
-                f"{thr_line} | ⏱ Uptime: `{uptime}`\n"
-                "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n"
-            )
+            # 🟢 B | 142 th | Актив: Аккаунт1
+            # 🔴 C | Offline | Актив: None
+            if state == "RUNNING":
+                msg += f"{icon} {suffix} | {thr_info} th | Актив: {active_acc}\n"
+            else:
+                msg += f"{icon} {suffix} | {status_text} | Актив: None\n"
 
         return msg.rstrip()
 
@@ -154,15 +131,10 @@ class UIManager:
     @staticmethod
     def get_clones_hub_keyboard(clones_data: list) -> InlineKeyboardMarkup:
         """
-        Row 0: [⚡️ Mass Start] [❄️ Mass Stop]
         Rows 1-N: [⚙️ CloneA] [⚙️ CloneB]  (2 per row)
         Last: [🏠 HOME]
         """
         rows = []
-        rows.append([
-            InlineKeyboardButton("⚡️ Mass Start", callback_data="mass_start"),
-            InlineKeyboardButton("❄️ Mass Stop",  callback_data="mass_stop"),
-        ])
         names = [c.get("name", "?") for c in clones_data]
         for i in range(0, len(names), 2):
             row = [
