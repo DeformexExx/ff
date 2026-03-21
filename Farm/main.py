@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Aegis bot — V7.5
+# Aegis bot — V8.5
 import os
 import sys
 import enum
@@ -29,7 +29,7 @@ from injection_engine    import InjectionEngine
 from bash_utils          import run_bash
 from persistence_manager import PersistenceManager
 
-VERSION = "7.5"
+VERSION = "8.5"
 
 if len(sys.argv) < 2:
     print("❌  Usage: python main.py <DEVICE_ID>")
@@ -66,10 +66,44 @@ class TelegramLogHandler(logging.Handler):
         asyncio.create_task(self.bot.add_log_line(self.format(record)))
 
 
+async def watchdog_safe_restart(
+    application: Application,
+    bot_instance: "AegisBot",
+    name: str,
+    reason: str,
+) -> None:
+    """Изолированный рестарт одного клона: force-stop → drop_caches → _enqueue_start."""
+    suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
+    bot_instance.watchdog_cpu_low_since.pop(name, None)
+    admin = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+    if admin:
+        try:
+            await application.bot.send_message(
+                admin,
+                f"⚠️ <code>{html.escape(name.replace('_', '-'))}</code> · {html.escape(reason)}",
+                parse_mode="HTML",
+            )
+        except TelegramError:
+            pass
+
+    await run_bash(f"su -c 'am force-stop com.roblox.clien{suffix}'")
+    await run_bash('su -c "echo 3 > /proc/sys/vm/drop_caches"')
+    await asyncio.sleep(2)
+    bot_instance.set_state(name, CloneState.STOPPED)
+    asyncio.create_task(bot_instance._enqueue_start(name, admin))
+
+
 async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
-    """Только детект зависания по низкой загрузке CPU (0–1%), 3 проверки подряд."""
-    cpu_idle_strikes: Dict[str, int] = {}
-    cpu_last_check: Dict[str, float] = {}
+    """
+    Тройная проверка (RUNNING):
+    1) Liveness — pgrep не находит процесс
+    2) Threads — th < 130 (после grace 120 с)
+    3) CPU — < 2% непрерывно 3 минуты при th >= 130
+    """
+    GRACE_SEC = 120
+    MIN_THREADS = 130
+    CPU_FREEZE_PCT = 2.0
+    CPU_FREEZE_SEC = 180
 
     while True:
         await asyncio.sleep(30)
@@ -81,64 +115,50 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                 if state != CloneState.RUNNING:
                     continue
 
-                st = await MonitorEngine.get_clone_status(name)
-                if "Offline" in st:
-                    bot_instance.clone_states[f"{name}:threads"] = "0"
-                    bot_instance.clone_states[f"{name}:status"] = "Offline"
-                    cpu_idle_strikes[name] = 0
+                suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
+                uptime = now - bot_instance.running_since.get(name, now)
+
+                alive = await MonitorEngine.clone_pgrep_alive(suffix)
+                if not alive:
+                    logger.warning(f"Watchdog [{name}]: liveness fail")
+                    await watchdog_safe_restart(
+                        application, bot_instance, name, "нет процесса (pgrep)"
+                    )
                     continue
 
+                st = await MonitorEngine.get_clone_status(name)
                 m_thr = re.search(r"Thr:\s*(\d+)", st)
                 thr = int(m_thr.group(1)) if m_thr else 0
                 bot_instance.clone_states[f"{name}:threads"] = str(thr)
 
-                uptime = now - bot_instance.running_since.get(name, now)
-                if uptime < 120:
-                    cpu_idle_strikes[name] = 0
-                    continue
-
-                if now - cpu_last_check.get(name, 0) < 150:
-                    continue
-                cpu_last_check[name] = now
-
-                suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
-                top_cmd = f"su -c \"top -n 1 -b | grep com.roblox.clien{suffix}\""
-                _, top_out, _ = await run_bash(top_cmd)
-                top_line = top_out.strip().splitlines()[0] if top_out.strip() else ""
-                cpu_match = re.search(r"(\d+(?:\.\d+)?)%", top_line)
-                cpu_val = float(cpu_match.group(1)) if cpu_match else -1.0
-
-                if 0.0 <= cpu_val <= 1.0:
-                    cpu_idle_strikes[name] = cpu_idle_strikes.get(name, 0) + 1
-                    logger.warning(
-                        f"Watchdog [{name}]: CPU {cpu_val}% ({cpu_idle_strikes[name]}/3)"
+                if uptime >= GRACE_SEC and thr < MIN_THREADS:
+                    logger.warning(f"Watchdog [{name}]: threads {thr} < {MIN_THREADS}")
+                    await watchdog_safe_restart(
+                        application, bot_instance, name, f"потоки {thr} < {MIN_THREADS}"
                     )
-                else:
-                    cpu_idle_strikes[name] = 0
-
-                if cpu_idle_strikes.get(name, 0) < 3:
                     continue
 
-                cpu_idle_strikes[name] = 0
-                bot_instance.clone_states[f"{name}:status"] = "CPU freeze"
-                bot_instance.set_state(name, CloneState.STOPPED)
-
-                admin = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
-                if admin:
-                    try:
-                        s_esc = html.escape(suffix.upper())
-                        await application.bot.send_message(
-                            admin,
-                            f"⚠️ Клон <code>{s_esc}</code> завис (0% CPU). Перезапуск...",
-                            parse_mode="HTML",
-                        )
-                    except TelegramError:
-                        pass
-
-                await run_bash(f"su -c 'am force-stop com.roblox.clien{suffix}'")
-                await run_bash('su -c "echo 3 > /proc/sys/vm/drop_caches"')
-                await asyncio.sleep(2)
-                asyncio.create_task(bot_instance._enqueue_start(name, admin))
+                if uptime >= GRACE_SEC and thr >= MIN_THREADS:
+                    cpu = await MonitorEngine.get_clone_cpu_percent(suffix)
+                    if cpu < 0:
+                        bot_instance.watchdog_cpu_low_since.pop(name, None)
+                    elif cpu < CPU_FREEZE_PCT:
+                        t0 = bot_instance.watchdog_cpu_low_since.get(name)
+                        if t0 is None:
+                            bot_instance.watchdog_cpu_low_since[name] = now
+                        elif now - t0 >= CPU_FREEZE_SEC:
+                            logger.warning(
+                                f"Watchdog [{name}]: CPU {cpu}% < {CPU_FREEZE_PCT}% {CPU_FREEZE_SEC}s"
+                            )
+                            await watchdog_safe_restart(
+                                application,
+                                bot_instance,
+                                name,
+                                f"CPU < {CPU_FREEZE_PCT}% {CPU_FREEZE_SEC}s",
+                            )
+                            continue
+                    else:
+                        bot_instance.watchdog_cpu_low_since.pop(name, None)
 
             await bot_instance.refresh_dashboard()
         except Exception as e:
@@ -164,6 +184,7 @@ class AegisBot:
         self.running_since: Dict[str, float] = {}
         self._start_lock = asyncio.Lock()
         self.is_mass_starting = False
+        self.watchdog_cpu_low_since: Dict[str, Optional[float]] = {}
 
         for c in self.config.clones_data:
             n = c.get("name")
@@ -173,6 +194,7 @@ class AegisBot:
     def reset_all_states(self):
         """Старт: все клоны в простое (IDLE), без автозапуска."""
         self.is_mass_starting = False
+        self.watchdog_cpu_low_since.clear()
         for c in self.config.clones_data:
             n = c.get("name")
             if n:
@@ -196,6 +218,21 @@ class AegisBot:
 
     async def _is_admin(self, uid: int) -> bool:
         return uid in self.config.admin_ids
+
+    async def _apply_immortality(self) -> None:
+        """OOM shield, max priority, wake lock (Termux)."""
+        pid = os.getpid()
+        r, _, err = await run_bash(f"su -c 'echo -1000 > /proc/{pid}/oom_score_adj'")
+        if r != 0:
+            logger.warning(f"oom_score_adj: {err}")
+        try:
+            os.nice(-20)
+        except Exception as e:
+            logger.warning(f"nice(-20): {e}")
+        await run_bash("termux-wake-lock 2>/dev/null || true")
+        tw = "/data/data/com.termux/files/usr/bin/termux-wake-lock"
+        if os.path.isfile(tw):
+            await run_bash(f"\"{tw}\" 2>/dev/null || true")
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update.effective_user.id): return
@@ -309,21 +346,36 @@ class AegisBot:
         )
 
     async def _hub_view(self) -> Tuple[str, Dict]:
-        tasks = []
-        for c in self.config.clones_data:
-            name = c.get("name")
-            if not name:
-                continue
-            sfx = name[-1].lower() if name.lower().startswith("clien") else name.lower()
+        async def collect_one(clone_name: str) -> Tuple[str, str, str, str, str]:
+            name_disp = clone_name.replace("_", "-")
+            sfx = clone_name[-1].lower() if clone_name.lower().startswith("clien") else clone_name.lower()
+            alive, st, cpu = await asyncio.gather(
+                MonitorEngine.clone_pgrep_alive(sfx),
+                MonitorEngine.get_clone_status(clone_name),
+                MonitorEngine.get_clone_cpu_percent(sfx),
+            )
+            m_thr = re.search(r"Thr:\s*(\d+)", st)
+            thr = int(m_thr.group(1)) if m_thr else 0
+            cpu_str = f"{cpu:.0f}" if cpu >= 0 else "—"
+            self.clone_states[f"{clone_name}:threads"] = str(thr)
+            self.clone_states[f"{clone_name}:cpu"] = cpu_str
+            cstate = self.clone_states.get(clone_name, CloneState.STOPPED)
+            healthy = (
+                cstate == CloneState.RUNNING
+                and alive
+                and thr >= 130
+                and cpu >= 2.0
+            )
+            return (
+                name_disp,
+                str(cstate),
+                str(thr),
+                cpu_str,
+                "1" if healthy else "0",
+            )
 
-            async def update_clone_stats(n, s):
-                pid = await MonitorEngine.get_pid(s)
-                thr = await MonitorEngine.get_threads(pid) if pid else 0
-                self.clone_states[f"{n}:threads"] = str(thr)
-
-            tasks.append(update_clone_stats(name, sfx))
-        if tasks:
-            await asyncio.gather(*tasks)
+        names = [c.get("name") for c in self.config.clones_data if c.get("name")]
+        rows = await asyncio.gather(*[collect_one(n) for n in names]) if names else []
 
         state_map: Dict[str, str] = {}
         for n, s in self.clone_states.items():
@@ -333,6 +385,13 @@ class AegisBot:
             else:
                 clean_n = n.replace("_", "-")
             state_map[clean_n] = str(s)
+
+        for row in rows:
+            name_disp, st, thr, cpu_str, h = row
+            state_map[name_disp] = st
+            state_map[f"{name_disp}:threads"] = thr
+            state_map[f"{name_disp}:cpu"] = cpu_str
+            state_map[f"{name_disp}:healthy"] = h
 
         text = UIManager.format_clones_hub(self.config.clones_data, state_map, VERSION)
         return text, state_map
@@ -358,22 +417,36 @@ class AegisBot:
                 break
 
         pid_sfx = suffix[-1].lower() if suffix.startswith("clien") else suffix.lower()
-        pid = await MonitorEngine.get_pid(pid_sfx)
-        thr = await MonitorEngine.get_threads(pid) if pid else 0
+        alive, st, cpu = await asyncio.gather(
+            MonitorEngine.clone_pgrep_alive(pid_sfx),
+            MonitorEngine.get_clone_status(clone_name),
+            MonitorEngine.get_clone_cpu_percent(pid_sfx),
+        )
+        m_thr = re.search(r"Thr:\s*(\d+)", st)
+        thr = int(m_thr.group(1)) if m_thr else 0
+        cpu_str = f"{cpu:.0f}" if cpu >= 0 else "—"
 
-        if thr > 130:
-            self.set_state(clone_name, CloneState.RUNNING)
-        elif thr == 0:
-            self.set_state(clone_name, CloneState.STOPPED)
+        raw_state = self.clone_states.get(clone_name, CloneState.STOPPED)
+        healthy = (
+            raw_state == CloneState.RUNNING
+            and alive
+            and thr >= 130
+            and cpu >= 2.0
+        )
+        status_rus = (
+            "OK (3/3)"
+            if healthy
+            else ("Запуск…" if raw_state == CloneState.STARTING else "Не готов")
+        )
 
         acc_esc = html.escape(str(name_acc).replace('_', '-'))
 
-        raw_state = self.clone_states.get(clone_name, CloneState.STOPPED)
-        state_val = str(raw_state)
-        kb = UIManager.get_clone_submenu(clone_name, state_val, thr)
-        status_rus = "Работает" if thr > 10 else "Остановлен"
-
-        text = f"👤 <code>{acc_esc}</code>\nСтатус: {status_rus}\nПотоки: {thr} th"
+        kb = UIManager.get_clone_submenu(clone_name, str(raw_state), thr)
+        text = (
+            f"👤 <code>{acc_esc}</code>\n"
+            f"Статус: {status_rus}\n"
+            f"{thr} th · {cpu_str}% CPU · pgrep: {'да' if alive else 'нет'}"
+        )
 
         await context.bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
 
@@ -753,6 +826,8 @@ class AegisBot:
 
         await app.initialize()
         await app.start()
+
+        await self._apply_immortality()
 
         asyncio.create_task(watchdog_loop(app, self))
 

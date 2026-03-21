@@ -35,11 +35,12 @@ class InjectionEngine:
             db_path = f"/data/data/com.roblox.{clone_name}/app_webview/Default/Cookies"
             current_time = int(time.time() * 1000000)
             
+            cookie_sql = cookie.replace("'", "''")
             sql_del = "DELETE FROM cookies;"
             sql_ins = (
                 f"INSERT INTO cookies (creation_utc, host_key, top_frame_site_key, name, value, path, "
                 f"expires_utc, is_secure, is_httponly, last_access_utc, has_expires, is_persistent, samesite, source_port) "
-                f"VALUES ({current_time}, '.roblox.com', '', '.ROBLOSECURITY', '{cookie}', '/', 253402300799000000, 1, 1, "
+                f"VALUES ({current_time}, '.roblox.com', '', '.ROBLOSECURITY', '{cookie_sql}', '/', 253402300799000000, 1, 1, "
                 f"{current_time}, 1, 1, -1, -1);"
             )
             

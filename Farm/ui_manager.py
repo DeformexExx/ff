@@ -10,13 +10,13 @@ def _clone_letter(name: str) -> str:
     return name.replace("_", "-").upper()[:4]
 
 
-def _status_emoji_for_hub(state: str, thr_val: int) -> str:
+def _hub_emoji(state: str, healthy: bool) -> str:
     s = str(state).upper()
     if s == "STARTING":
         return "⏳"
-    if thr_val > 130:
+    if s == "RUNNING" and healthy:
         return "🟢"
-    if thr_val > 0:
+    if s == "RUNNING":
         return "🟡"
     return "🔴"
 
@@ -77,16 +77,21 @@ class UIManager:
         for clone in clones_data:
             raw_name = clone.get("name", "?")
             name_disp = raw_name.replace("_", "-")
-            raw_s = state_map.get(name_disp, "STOPPED")
-            state = str(raw_s).upper()
-            thr_info = str(state_map.get(f"{name_disp}:threads", "0"))
+            nick = (clone.get("nickname") or clone.get("name") or "?").replace("_", "-")
+            nick_esc = html.escape(nick)
+            letter = _clone_letter(raw_name)
+            thr_raw = state_map.get(f"{name_disp}:threads", "0")
+            cpu_raw = state_map.get(f"{name_disp}:cpu", "—")
+            healthy = state_map.get(f"{name_disp}:healthy", "0") == "1"
+            state = str(state_map.get(name_disp, "STOPPED")).upper()
             try:
-                thr_val = int(thr_info)
+                thr_val = int(thr_raw)
             except ValueError:
                 thr_val = 0
-            letter = _clone_letter(raw_name)
-            emoji = _status_emoji_for_hub(state, thr_val)
-            lines.append(f"{emoji} <b>{letter}</b> · {thr_val} th")
+            emoji = _hub_emoji(state, healthy)
+            lines.append(
+                f"[{letter}] {emoji} {nick_esc} | {thr_val} th | {cpu_raw}% CPU"
+            )
 
         return "\n".join(lines)
 
@@ -99,15 +104,10 @@ class UIManager:
             if not raw_name:
                 continue
             name_disp = raw_name.replace("_", "-")
-            raw_s = state_map.get(name_disp, "STOPPED")
-            state = str(raw_s).upper()
-            thr_info = str(state_map.get(f"{name_disp}:threads", "0"))
-            try:
-                thr_val = int(thr_info)
-            except ValueError:
-                thr_val = 0
+            healthy = state_map.get(f"{name_disp}:healthy", "0") == "1"
+            state = str(state_map.get(name_disp, "STOPPED")).upper()
             letter = _clone_letter(raw_name)
-            emoji = _status_emoji_for_hub(state, thr_val)
+            emoji = _hub_emoji(state, healthy)
             label = f"{emoji} {letter}"
             chunk.append(
                 InlineKeyboardButton(label, callback_data=f"clone_{raw_name}")
