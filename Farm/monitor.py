@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-# Aegis MonitorEngine — V9.0
+# Aegis MonitorEngine — V10.0
 import os
 import re
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 from bash_utils import run_bash
 
 logger = logging.getLogger("MonitorEngine")
@@ -60,13 +60,48 @@ class MonitorEngine:
 
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
+    async def get_ram_free_gb() -> str:
+        """
+        Returns available RAM as string like '2.1 GB free'.
+        Reads /proc/meminfo — works on Android without psutil.
+        """
+        try:
+            with open("/proc/meminfo", "r") as f:
+                content = f.read()
+            # MemAvailable is most accurate; fall back to MemFree
+            m = re.search(r"MemAvailable:\s+(\d+)\s+kB", content)
+            if not m:
+                m = re.search(r"MemFree:\s+(\d+)\s+kB", content)
+            if m:
+                kb = int(m.group(1))
+                return f"{kb / 1024 / 1024:.1f} GB free"
+        except Exception:
+            pass
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            return f"{mem.available / 1024 / 1024 / 1024:.1f} GB free"
+        except Exception:
+            pass
+        return "N/A"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    @staticmethod
     async def get_pid(suffix: str) -> Optional[str]:
         """
-        Strict PID discovery: ps -A | grep | grep -v grep.
+        Strict PID discovery: pgrep first (fast), then ps -A fallback.
         Returns string PID or None.
         """
-        cmd = f"su -c 'ps -A | grep com.roblox.clien{suffix} | grep -v grep'"
-        _, stdout, _ = await run_bash(cmd)
+        pkg = f"com.roblox.clien{suffix}"
+        # Fast path via pgrep
+        _, pg_out, _ = await run_bash(f"su -c 'pgrep -f {pkg} | head -n 1'")
+        pid = pg_out.strip().splitlines()[0].strip() if pg_out.strip() else ""
+        if pid and pid.isdigit():
+            return pid
+        # Fallback: ps -A
+        _, stdout, _ = await run_bash(
+            f"su -c 'ps -A | grep {pkg} | grep -v grep'"
+        )
         output = stdout.strip()
         if output:
             try:
@@ -79,17 +114,31 @@ class MonitorEngine:
     @staticmethod
     async def get_threads(pid: str) -> int:
         """
-        Accurate thread count via /proc/{pid}/task.
+        Thread count via /proc/{pid}/status Threads field (most reliable).
+        Falls back to ls /proc/{pid}/task | wc -l.
         Returns 0 on any failure.
         """
         if not pid or not str(pid).isdigit():
             return 0
-        _, stdout, _ = await run_bash(f"su -c \"ls /proc/{pid}/task | wc -l\"")
+        # Primary: /proc/{pid}/status Threads line
+        _, stdout, _ = await run_bash(
+            f"su -c \"cat /proc/{pid}/status | grep Threads\""
+        )
         raw = stdout.strip()
-        if not raw or any(e in raw.lower() for e in ("rooting", "no such", "denied")):
+        if raw:
+            m = re.search(r"Threads:\s*(\d+)", raw)
+            if m:
+                try:
+                    return int(m.group(1))
+                except ValueError:
+                    pass
+        # Fallback: task directory count
+        _, stdout2, _ = await run_bash(f"su -c \"ls /proc/{pid}/task | wc -l\"")
+        raw2 = stdout2.strip()
+        if not raw2 or any(e in raw2.lower() for e in ("no such", "denied")):
             return 0
         try:
-            return int(raw)
+            return int(raw2)
         except ValueError:
             return 0
 
@@ -159,6 +208,47 @@ class MonitorEngine:
         except Exception as e:
             logger.debug(f"get_clone_cpu_percent fallback error [{suffix}]: {e}")
             return -1.0
+
+    # ─────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    async def get_clone_stats(suffix: str) -> Tuple[bool, int, float]:
+        """
+        Single-call triple-check: returns (is_alive, threads, cpu_percent).
+        Uses the manifest command:
+          su -c "cat /proc/$(pgrep -f com.roblox.clien{suffix} | head -n 1)/status | grep Threads"
+        cpu_percent is -1.0 when not measurable.
+        """
+        pkg = f"com.roblox.clien{suffix}"
+
+        # ── liveness ──────────────────────────────────────────────────────────
+        is_alive = await clone_pgrep_alive(suffix)
+        if not is_alive:
+            return False, 0, -1.0
+
+        # ── threads via /proc/status Threads field ────────────────────────────
+        threads = 0
+        _, thr_out, _ = await run_bash(
+            f"su -c \"cat /proc/$(pgrep -f {pkg} | head -n 1)/status | grep Threads\""
+        )
+        thr_raw = thr_out.strip()
+        if thr_raw:
+            m = re.search(r"Threads:\s*(\d+)", thr_raw)
+            if m:
+                try:
+                    threads = int(m.group(1))
+                except ValueError:
+                    pass
+
+        if not threads:
+            # fallback: get PID then task dir
+            pid = await MonitorEngine.get_pid(suffix)
+            if pid:
+                threads = await MonitorEngine.get_threads(pid)
+
+        # ── CPU ───────────────────────────────────────────────────────────────
+        cpu = await MonitorEngine.get_clone_cpu_percent(suffix)
+
+        return True, threads, cpu
 
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod

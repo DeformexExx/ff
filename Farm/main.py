@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Aegis bot — V9.0
+# Aegis bot — V10.0
 import os
 import sys
 import enum
@@ -67,7 +67,7 @@ from injection_engine    import InjectionEngine
 from bash_utils          import run_bash
 from persistence_manager import PersistenceManager
 
-VERSION = "9.0"
+VERSION = "10.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,7 +77,7 @@ logging.basicConfig(
         logging.FileHandler(BOOT_LOG, encoding="utf-8"),
     ]
 )
-logger = logging.getLogger("AegisV90")
+logger = logging.getLogger("AegisV10")
 for _quiet in ("httpx", "httpcore", "telegram", "telegram.ext", "telegram.request"):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
@@ -230,6 +230,30 @@ class AegisBot:
             if n:
                 self.set_state(n, CloneState.STOPPED)
 
+    def _sync_dev_json_status(self, name: str, status: str) -> None:
+        """
+        Write clone status directly into DEV_{DEVICE_ID}.json so auto-recovery
+        can read it on next boot. Non-fatal: any error is silently logged.
+        """
+        import json as _json
+        dev_path = os.path.join(FARM_DIR, f"{DEVICE_ID}.json")
+        if not os.path.exists(dev_path):
+            return
+        try:
+            with open(dev_path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            changed = False
+            for clone in data.get("clones", []):
+                if clone.get("name") == name:
+                    clone["status"] = status.lower()
+                    changed = True
+                    break
+            if changed:
+                with open(dev_path, "w", encoding="utf-8") as f:
+                    _json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logger.debug(f"_sync_dev_json_status [{name}={status}]: {e}")
+
     def set_state(self, name: str, state: CloneState):
         if ":" in name: return
         old = self.clone_states.get(name, CloneState.STOPPED)
@@ -241,10 +265,12 @@ class AegisBot:
         logger.info(f"State [{name}]: {str(old)} → {str(state)}")
         if state == CloneState.RUNNING:
             self.config.update_clone_status(name, "RUNNING")
+            self._sync_dev_json_status(name, "RUNNING")
         elif state == CloneState.STARTING:
             self.config.update_clone_status(name, "STARTING")
         elif state == CloneState.STOPPED:
             self.config.update_clone_status(name, "IDLE")
+            self._sync_dev_json_status(name, "idle")
 
     async def _is_admin(self, uid: int) -> bool:
         return uid in self.config.admin_ids
@@ -414,6 +440,12 @@ class AegisBot:
             state_map[f"{name_disp}:cpu"] = cpu_str
             state_map[f"{name_disp}:healthy"] = h
 
+        # Inject RAM info for V10 dashboard header
+        try:
+            state_map["__ram_free__"] = await MonitorEngine.get_ram_free_gb()
+        except Exception:
+            state_map["__ram_free__"] = "N/A"
+
         text = UIManager.format_clones_hub(self.config.clones_data, state_map, VERSION)
         return text, state_map
 
@@ -531,7 +563,22 @@ class AegisBot:
             elif d == "sys_sync":  await self._git_sync(chat)
             elif d == "sys_screenshot": await self._take_screenshot(q.message)
             elif d == "sys_help": await q.message.reply_text(UIManager.get_help_text(), parse_mode="HTML")
-            
+
+            elif d == "deep_clean":
+                await context.bot.send_message(chat, "🧹 Deep clean…", parse_mode="HTML")
+                await self._do_deep_clean()
+                await context.bot.send_message(chat, "✅ Drop caches done.", parse_mode="HTML")
+
+            elif d == "hub_refresh":
+                self.config.reload()
+                text, sm = await self._hub_view()
+                hub_msg = await q.message.reply_text(
+                    text,
+                    reply_markup=UIManager.get_clones_hub_keyboard(self.config.clones_data, sm),
+                    parse_mode="HTML",
+                )
+                self._dash_msg = hub_msg
+
             elif d == "mass_start":
                 chat_id = q.message.chat.id
                 asyncio.create_task(self._mass_start(chat_id))
@@ -617,6 +664,9 @@ class AegisBot:
                     pass
 
             suffix = name[-1].lower() if name.startswith("clien") else name.lower()
+            # Deep clean before every launch
+            await run_bash("su -c 'sync'")
+            await run_bash('su -c "echo 3 > /proc/sys/vm/drop_caches"')
             await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
 
             import json, os
@@ -644,23 +694,28 @@ class AegisBot:
 
         await self.refresh_dashboard(force=True)
 
+    async def _do_deep_clean(self) -> None:
+        """Global deep clean: sync + drop_caches. Safe to call anytime."""
+        await run_bash("su -c 'sync'")
+        await run_bash('su -c "echo 3 > /proc/sys/vm/drop_caches"')
+        logger.info("Deep clean: drop_caches done.")
+
     async def _mass_start(self, chat_id):
-        """Sequential mass start via the _start_lock queue."""
+        """Staggered mass start: one clone every 45 s to avoid RAM spikes."""
+        STAGGER_SEC = 45
         self.is_mass_starting = True
         clones = [c for c in self.config.clones_data if c.get("active", True)]
-        
+
         app = self.application
         if not (chat_id and app): return
 
         try:
             m = await app.bot.send_message(chat_id, "▶️ Массовый запуск…", parse_mode="HTML")
-            await m.edit_text("▶️ Очистка кэша…", parse_mode="HTML")
-            for c in clones:
-                name = c.get("name")
-                if name:
-                    suffix = name[-1].lower() if name.startswith("clien") else name.lower()
-                    await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
-            await m.edit_text("▶️ Запуск по очереди…", parse_mode="HTML")
+            # Global deep clean before batch
+            await m.edit_text("🧹 Deep clean…", parse_mode="HTML")
+            await self._do_deep_clean()
+            await m.edit_text(f"▶️ Запуск {len(clones)} клонов (пауза {STAGGER_SEC}с)…", parse_mode="HTML")
+
             for idx, c in enumerate(clones, 1):
                 if not self.is_mass_starting:
                     break
@@ -673,6 +728,9 @@ class AegisBot:
                     parse_mode="HTML",
                 )
                 await self._enqueue_start(name, chat_id)
+                # Stagger — wait between clones (skip after the last one)
+                if idx < len(clones) and self.is_mass_starting:
+                    await asyncio.sleep(STAGGER_SEC)
         except Exception as e:
             logger.error(f"Mass Start Error: {e}")
         finally:
@@ -853,6 +911,9 @@ class AegisBot:
 
         self.reset_all_states()
 
+        # ── AUTO-RECOVERY: restore RUNNING clones from DEV_{id}.json ─────────
+        asyncio.create_task(self._auto_recover())
+
         logger.info(f"Aegis V{VERSION} online — {DEVICE_ID}")
 
         await app.updater.start_polling(drop_pending_updates=True)
@@ -865,6 +926,58 @@ class AegisBot:
         finally:
             await app.stop()
             await app.shutdown()
+
+
+    async def _auto_recover(self) -> None:
+        """
+        Startup auto-recovery: scan DEV_{DEVICE_ID}.json for clones with
+        status == 'RUNNING'. For each, check pgrep. If process is missing,
+        launch it. Runs once, 10 s after startup (let bot settle first).
+        """
+        await asyncio.sleep(10)
+        import json as _json
+        dev_path = os.path.join(FARM_DIR, f"{DEVICE_ID}.json")
+        if not os.path.exists(dev_path):
+            logger.info("Auto-recovery: DEV file not found, skipping.")
+            return
+        try:
+            with open(dev_path, "r", encoding="utf-8") as f:
+                dev_data = _json.load(f)
+        except Exception as e:
+            logger.error(f"Auto-recovery read error: {e}")
+            return
+
+        clones_list = dev_data.get("clones", [])
+        to_recover = [c for c in clones_list if str(c.get("status", "")).upper() == "RUNNING"]
+        if not to_recover:
+            logger.info("Auto-recovery: no RUNNING clones in DEV file.")
+            return
+
+        logger.info(f"Auto-recovery: {len(to_recover)} candidate(s).")
+        admin = self.config.admin_ids[0] if self.config.admin_ids else None
+
+        for c in to_recover:
+            name = c.get("name")
+            if not name:
+                continue
+            suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
+            alive = await clone_pgrep_alive(suffix)
+            if alive:
+                logger.info(f"Auto-recovery [{name}]: process alive, marking RUNNING.")
+                self.set_state(name, CloneState.RUNNING)
+            else:
+                logger.warning(f"Auto-recovery [{name}]: process dead, relaunching.")
+                if admin and self.application:
+                    try:
+                        await self.application.bot.send_message(
+                            admin,
+                            f"🔄 Auto-recover: <code>{html.escape(name.replace('_','-'))}</code>",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                asyncio.create_task(self._enqueue_start(name, admin))
+                await asyncio.sleep(5)  # small gap between recovery launches
 
 
 if __name__ == "__main__":

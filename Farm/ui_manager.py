@@ -73,12 +73,23 @@ class UIManager:
         if not clones_data:
             return "<i>Нет клонов в конфиге.</i>"
 
-        lines = []
+        SEP = "━━━━━━━━━━━━━━━━━━━━"
+        ram_free = state_map.get("__ram_free__", "N/A")
+
+        header = (
+            f"💎 <b>AEGIS OS V{_version}</b> | 🧠 RAM: <b>{html.escape(ram_free)}</b>\n"
+            f"{SEP}\n"
+            f"<code>ID  STATUS    ACCOUNT      TH    CPU</code>"
+        )
+
+        lines = [header]
         for clone in clones_data:
             raw_name = clone.get("name", "?")
             name_disp = raw_name.replace("_", "-")
             nick = (clone.get("nickname") or clone.get("name") or "?").replace("_", "-")
-            nick_esc = html.escape(nick)
+            # Truncate nick to 12 chars for alignment
+            nick_short = nick[:12] if len(nick) > 12 else nick
+            nick_esc = html.escape(nick_short)
             letter = _clone_letter(raw_name)
             thr_raw = state_map.get(f"{name_disp}:threads", "0")
             cpu_raw = state_map.get(f"{name_disp}:cpu", "—")
@@ -86,13 +97,24 @@ class UIManager:
             state = str(state_map.get(name_disp, "STOPPED")).upper()
             try:
                 thr_val = int(thr_raw)
-            except ValueError:
+            except (ValueError, TypeError):
                 thr_val = 0
             emoji = _hub_emoji(state, healthy)
+            # Status label short
+            if state == "RUNNING" and healthy:
+                st_label = "ACTIVE"
+            elif state == "RUNNING":
+                st_label = "STUCK"
+            elif state == "STARTING":
+                st_label = "START…"
+            else:
+                st_label = "IDLE"
+            cpu_display = f"{cpu_raw}%" if cpu_raw != "—" else "0%"
             lines.append(
-                f"[{letter}] {emoji} {nick_esc} | {thr_val} th | {cpu_raw}% CPU"
+                f"<code>[{letter}] {emoji} {st_label:<6}  {nick_esc:<12}  {thr_val:<5}  {cpu_display}</code>"
             )
 
+        lines.append(SEP)
         return "\n".join(lines)
 
     @staticmethod
@@ -129,8 +151,14 @@ class UIManager:
             rows.append(chunk)
         rows.append(
             [
-                InlineKeyboardButton("▶️ Все", callback_data="mass_start"),
-                InlineKeyboardButton("🛑 Все", callback_data="mass_stop"),
+                InlineKeyboardButton("🚀 START ALL", callback_data="mass_start"),
+                InlineKeyboardButton("🛑 STOP ALL", callback_data="mass_stop"),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton("♻️ REFRESH", callback_data="hub_refresh"),
+                InlineKeyboardButton("🧹 DEEP CLEAN", callback_data="deep_clean"),
             ]
         )
         rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="nav_home")])
