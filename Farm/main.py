@@ -488,15 +488,28 @@ class AegisBot:
                 await self._take_screenshot(q.message)
 
             elif d.startswith("clone_"):
-                name_esc  = html.escape(name.replace('_', '-'))
-                raw_state = self.clone_states.get(name, CloneState.STOPPED)
+                c_name = d[6:]
+                name = "Unknown"
+                for c in self.config.clones_data:
+                    if c.get("name") == c_name:
+                        name = c.get("account", "Unknown")
+                        break
+                
+                name_esc  = html.escape(c_name.replace('_', '-'))
+                acc_esc   = html.escape(name.replace('_', '-'))
+                raw_state = self.clone_states.get(c_name, CloneState.STOPPED)
                 state_val = str(raw_state)
                 
                 s_val_esc = html.escape(state_val)
-                kb    = UIManager.get_clone_submenu(name, state_val)
+                kb    = UIManager.get_clone_submenu(c_name, state_val)
+                
+                text = f"⚙️ <b>{name_esc.upper()}</b>\n"
+                text += f"👤 Аккаунт: <code>{acc_esc}</code>\n"
+                text += f"State: <code>{s_val_esc}</code>"
+                
                 await context.bot.send_message(
                     chat,
-                    f"⚙️ <b>{name_esc.upper()}</b>\nState: <code>{s_val_esc}</code>",
+                    text,
                     reply_markup=kb, parse_mode="HTML"
                 )
 
