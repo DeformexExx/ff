@@ -1,0 +1,16 @@
+{
+  "bot_token": "8640547661:AAGi1FN138glWQPnRDAkjwm5ssImv37MV5A",
+  "admin_ids": [6961471062],
+  "clones": [
+    "com.roblox.clienb",
+    "com.roblox.clienc",
+    "com.roblox.cliend",
+    "com.roblox.cliene",
+    "com.roblox.clienf",
+    "com.roblox.clieng",
+    "com.roblox.clienh",
+    "com.roblox.clieni"
+  ],
+  "github_url": "https://raw.githubusercontent.com/DeformexExx/farm/refs/heads/main",
+  "default_link": "https://www.roblox.com/share?code=e31840ddb098f441b30d59d9fd5d17c0&type=Server"
+}
