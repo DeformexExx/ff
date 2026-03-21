@@ -35,42 +35,49 @@ class MonitorEngine:
     @staticmethod
     async def get_clone_status(clone_name: str) -> str:
         """
-        V5.7 Kernel Sight: Checks for clone using root-level ps chain.
+        V6.0 Stable: Advanced root-level monitoring via /proc FS.
         """
-        # Optimized PID discovery (V5.7 awk chain)
-        # Suffix is extracted from com.roblox.clien[suffix]
+        # Suffix extracion: clienb -> b, clienc -> c
         suffix = clone_name[-1] if clone_name.startswith("clien") else clone_name
+        
+        # 1. PID Discovery (V6.0 confirmed awk chain)
         cmd_pid = f"su -c \"ps -ef | grep com.roblox.clien{suffix} | grep -v grep | awk '{{print $2}}'\""
         ret, stdout_pid, _ = await run_bash(cmd_pid)
-        pid = stdout_pid.strip()
         
-        if pid:
-            try:
-                # Kernel-level threads and memory (V5.7)
-                cmd_st = f"su -c \"cat /proc/{pid}/status | grep -E '(VmRSS|Threads)'\""
-                _, stdout_st, _ = await run_bash(cmd_st)
-                
-                cmd_stat = f"su -c \"cat /proc/{pid}/stat\""
-                _, stdout_stat, _ = await run_bash(cmd_stat)
-                
-                cpu_ticks = "0"
-                if stdout_stat:
-                    parts = stdout_stat.split()
-                    if len(parts) >= 15:
-                        cpu_ticks = str(int(parts[13]) + int(parts[14]))
-                
-                threads, mem = "?", "?"
-                for line in stdout_st.split('\n'):
-                    line = line.strip()
-                    if line.startswith('VmRSS:'):
-                        p = line.split()
-                        if len(p) >= 2: mem = f"{int(p[1])//1024}MB"
-                    elif line.startswith('Threads:'):
-                        p = line.split()
-                        if len(p) >= 2: threads = p[1]
+        # Robust validation: check for error strings or multiple lines
+        raw_pid = stdout_pid.strip()
+        if any(err in raw_pid for err in ["rooting", "No such", "denied", "found"]):
+            return "Offline"
+            
+        pid = raw_pid.split('\n')[0] if raw_pid else ""
+        if not pid or not pid.isdigit():
+            return "Offline"
+
+        try:
+            # 2. Thread Counting (V6.0 Kernel confirmed)
+            cmd_thr = f"su -c \"ls /proc/{pid}/task | wc -l\""
+            _, stdout_thr, _ = await run_bash(cmd_thr)
+            
+            raw_thr = stdout_thr.strip()
+            if any(err in raw_thr for err in ["rooting", "No such", "denied"]):
+                threads = 0
+            else:
+                try:
+                    threads = int(raw_thr)
+                except ValueError:
+                    threads = 0
+
+            # 3. Memory & CPU (Still useful for UI, but subordinated to new discovery)
+            # We use the discovered PID to get VmRSS if it still exists
+            cmd_st = f"su -c \"cat /proc/{pid}/status | grep VmRSS\""
+            _, stdout_st, _ = await run_bash(cmd_st)
+            
+            mem = "?"
+            if "VmRSS:" in stdout_st:
+                p = stdout_st.split()
+                if len(p) >= 2: mem = f"{int(p[1])//1024}MB"
                                 
-                return f"Mem: {mem} | Thr: {threads} | CpuTicks: {cpu_ticks}"
-            except Exception as e:
-                logger.error(f"V5.7 Monitor Error: {e}")
-                return "Stats Error"
-        return "Offline"
+            return f"Mem: {mem} | Thr: {threads}"
+        except Exception as e:
+            logger.error(f"V6.0 Monitor Error: {e}")
+            return "Stats Error"

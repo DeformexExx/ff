@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# main.py — Project Aegis V5.3 Liquid Glass Edition
+# main.py — Project Aegis V6.0 Stable Edition
 import os
 import sys
 import enum
@@ -32,7 +32,7 @@ from persistence_manager import PersistenceManager
 # ═══════════════════════════════════════════════════════════════════════════
 # VERSION
 # ═══════════════════════════════════════════════════════════════════════════
-VERSION = "5.3"
+VERSION = "6.0 (Stable)"
 
 # ── DEVICE ID ──────────────────────────────────────────────────────────────
 if len(sys.argv) < 2:
@@ -77,36 +77,24 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
     """
 
     offline_strikes: Dict[str, int]   = {}
+    low_thread_strikes: Dict[str, int] = {}
     last_action:     Dict[str, float] = {}
-    cpu_zeros:       Dict[str, int]   = {}
 
-    # SILENT START: Skip everything for first 10 minutes
-    boot_time = time.time()
-    
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
         
-        # ══ 10-MINUTE TOTAL SILENCE ════════════════════════════════════
-        if time.time() - boot_time < 600:
-            logger.info(f"Watchdog: Silent Mode Active ({int(600 - (time.time() - boot_time))}s remaining)")
-            continue
         try:
             now = time.time()
 
             for name, state in list(bot_instance.clone_states.items()):
-                if ":" in name: continue # skip meta fields
+                if ":" in name: continue 
 
-                # ══ STATE GATE — The core fix ══════════════════════════════
                 if state != CloneState.RUNNING:
-                    if state == CloneState.STARTING:
-                        logger.debug(f"Watchdog: [{name}] STARTING — ignored.")
                     continue
 
-                # ── Post-action cooldown 60s ────────────────────────────
                 if now - last_action.get(name, 0) < 60:
                     continue
 
-                # ── Get status ──────────────────────────────────────────
                 st = await MonitorEngine.get_clone_status(name)
                 needs_action = False
                 reason       = ""
@@ -115,7 +103,7 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                     offline_strikes[name] = offline_strikes.get(name, 0) + 1
                     bot_instance.clone_states[f"{name}:status"] = "Offline"
                     if offline_strikes[name] >= 3:
-                        reason       = f"Offline ×{offline_strikes[name]}"
+                        reason       = f"Offline Strike 3/3"
                         needs_action = True
                     else:
                         logger.info(f"Watchdog [{name}]: Offline strike {offline_strikes[name]}/3")
@@ -126,51 +114,43 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                     thr = int(m_thr.group(1)) if m_thr else 0
                     bot_instance.clone_states[f"{name}:threads"] = str(thr)
                     
-                    m_cpu = re.search(r"CpuTicks:\s*(\d+)", st)
-                    cpu_ticks = m_cpu.group(1) if m_cpu else "0"
+                    # V6.0 Logic: Instant Death
+                    if thr < 10:
+                        reason = f"Instant Death (Thr:{thr}<10)"
+                        needs_action = True
                     
-                    last_ticks = getattr(bot_instance, f"_cpu_ticks_{name}", "0")
-                    setattr(bot_instance, f"_cpu_ticks_{name}", cpu_ticks)
-                    
-                    if cpu_ticks == last_ticks and cpu_ticks != "0":
-                        cpu_zeros[name] = cpu_zeros.get(name, 0) + 1
+                    # V6.0 Logic: 3-Minute Rule (6 strikes at 30s)
+                    elif thr < 110:
+                        low_thread_strikes[name] = low_thread_strikes.get(name, 0) + 1
+                        logger.info(f"[{name.upper()}] Low threads: {thr}. Strike {low_thread_strikes[name]}/6.")
+                        if low_thread_strikes[name] >= 6:
+                            reason = f"3-Min Fail (Thr:{thr}<110)"
+                            needs_action = True
                     else:
-                        cpu_zeros[name] = 0
-                        
-                    if thr < 80:
-                        reason       = f"Frozen (Thr:{thr}<80)"
-                        needs_action = True
-                    elif cpu_zeros.get(name, 0) >= 2:
-                        reason       = f"Lagging (CPU 0% for 120s)"
-                        needs_action = True
-                        cpu_zeros[name] = 0
-                    elif thr > 500:
-                        reason       = f"Leaking (Thr:{thr})"
-                        needs_action = True
+                        low_thread_strikes[name] = 0
 
                     if needs_action:
                         bot_instance.clone_states[f"{name}:status"] = "Lagging"
-                        bot_instance.config.update_clone_status(name, "Lagging")
                     else:
                         bot_instance.clone_states[f"{name}:status"] = "Stable"
 
                 if needs_action:
-                    last_action[name]       = now
-                    offline_strikes[name]   = 0
+                    last_action[name]        = now
+                    offline_strikes[name]    = 0
+                    low_thread_strikes[name] = 0
                     bot_instance.set_state(name, CloneState.STOPPED)
                     
-                    logger.warning(f"Watchdog: [{name}] {reason}. Queueing purge restart…")
+                    logger.warning(f"Watchdog: [{name}] {reason}. Relaunching…")
                     admin = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
                     if admin:
                         try:
                             await application.bot.send_message(
                                 admin,
-                                f"🐕 *Watchdog*: `{name}` → {reason}\n🧹 PURGE & RELAUNCH queued…",
+                                f"🐕 *Watchdog*: `{name}` → {reason}\n🧹 PURGE & RELAUNCH…",
                                 parse_mode="Markdown"
                             )
                         except TelegramError:
                             pass
-                    # Kick into startup queue via background task
                     asyncio.create_task(bot_instance._purge_restart(name, admin))
 
             await bot_instance.refresh_dashboard()

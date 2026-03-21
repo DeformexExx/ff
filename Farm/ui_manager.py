@@ -23,7 +23,7 @@ class UIManager:
     @staticmethod
     def get_welcome_text(device_id: str) -> str:
         return (
-            "💎 *AEGIS OVERLORD V5.0*\n"
+            "💎 *AEGIS OVERLORD V6.0*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"⚡️ SYSTEM : `[💠 ONLINE (SAFE)]`\n"
             f"📱 DEVICE : `{device_id}`\n"
@@ -53,7 +53,7 @@ class UIManager:
         ram_bar = UIManager._make_bar(ram)
         cpu_bar = UIManager._make_bar(cpu)
         return (
-            "💎 *AEGIS V5.2 — LIQUID GLASS*\n"
+            "💎 *AEGIS V6.0 — STABLE*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"📱 DEVICE  : `{device_id}`\n"
             f"🐕 WATCHDOG: `[DEEP MONITOR 🔒]`\n"
@@ -102,7 +102,7 @@ class UIManager:
         state_map:  {clone_name: CloneState (str value)}
         uptime_map: {clone_name: start_timestamp (float) or None}
         """
-        msg = "💎 *AEGIS OVERLORD V5.2*\n"
+        msg = "💎 *AEGIS OVERLORD V6.0*\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
         if not clones_data:
