@@ -469,7 +469,8 @@ class AegisBot:
             elif d == "sys_help": await q.message.reply_text(UIManager.get_help_text(), parse_mode="HTML")
             
             elif d == "mass_start":
-                asyncio.create_task(self._mass_start(chat))
+                chat_id = q.message.chat.id
+                asyncio.create_task(self._mass_start(chat_id))
                 await q.message.reply_text("🚀 Запуск фермы инициирован... Чистка кэша завершена.", parse_mode="HTML")
 
             elif d == "mass_stop":

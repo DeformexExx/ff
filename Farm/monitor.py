@@ -36,19 +36,20 @@ class MonitorEngine:
     @staticmethod
     async def get_pid(suffix: str) -> Optional[str]:
         """
-        V6.0 Final: Strict PID discovery via ps -A | grep | awk chain.
-        Returns first PID or None.
+        V6.0 Final: Strict PID discovery via ps -A | grep | grep -v.
         """
-        cmd = f"su -c \"ps -A | grep com.roblox.clien{suffix} | grep -v grep | awk '{{print $2}}'\""
+        cmd = f"su -c 'ps -A | grep com.roblox.clien{suffix} | grep -v grep'"
         _, stdout, _ = await run_bash(cmd)
         
-        raw = stdout.strip()
-        if not raw or any(err in raw.lower() for err in ["rooting", "no such", "denied", "found"]):
-            return None
-            
-        pids = raw.split('\n')
-        first_pid = pids[0].strip()
-        return first_pid if first_pid.isdigit() else None
+        output = stdout.strip()
+        if output:
+            try:
+                # Берем вторую колонку (PID) из первой строки вывода
+                pid = output.split()[1]
+                return pid
+            except IndexError:
+                pass
+        return None
 
     @staticmethod
     async def get_threads(pid: str) -> int:

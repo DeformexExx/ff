@@ -101,7 +101,8 @@ class UIManager:
 
         # Compact Tabular format
         for clone in clones_data:
-            name  = clone.get("name", "Unknown").replace('_', '-')
+            name = "Unknown"
+            name = clone.get("name", "Unknown").replace('_', '-')
             raw_s = state_map.get(name.replace('-', '_'), "STOPPED")
             state = str(raw_s).upper()
             
@@ -111,16 +112,6 @@ class UIManager:
             # Thread info (name already has '-' instead of '_')
             thr_info = str(state_map.get(f"{name}:threads", "0"))
             
-            # Account info
-            active_acc = clone.get("account")
-            if not active_acc:
-                active_acc = "Нет-аккаунта"
-            else:
-                active_acc = active_acc.replace('_', '-')
-            
-            acc_esc = html.escape(active_acc)
-            thr_esc = html.escape(thr_info)
-
             thr_val = 0
             try:
                 thr_val = int(thr_info)
@@ -129,8 +120,10 @@ class UIManager:
 
             if state == "STARTING":
                 msg += f"⏳ {suffix} | Loading....\n"
-            elif thr_val > 10:
-                msg += f"🟢 {suffix} | {thr_esc} th | Актив: {acc_esc}\n"
+            elif thr_val > 130:
+                msg += f"🟢 {suffix} | {thr_val} th\n"
+            elif thr_val > 0:
+                msg += f"🟡 {suffix} | Freeze ({thr_val})\n"
             else:
                 msg += f"🔴 {suffix} | Offline\n"
 
