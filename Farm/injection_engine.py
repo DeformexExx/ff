@@ -8,7 +8,7 @@ logger = logging.getLogger("InjectionEngine")
 
 class InjectionEngine:
     @staticmethod
-    async def inject_and_launch(clone_name: str, cookie: str, place_id: str, status_msg=None) -> bool:
+    def inject_and_launch(clone_name: str, cookie: str, place_id: str = None, link_code: str = None, status_msg=None) -> bool:
         """
         The strictly ordered, pure-bash injection mechanism.
         Возвращает True если запуск успешен, иначе False.
@@ -69,47 +69,28 @@ class InjectionEngine:
                 return False
 
             # 4. Launch (Monkey / Intent) (Golden Sequence)
-            await update_status(f"⏳ ({clone_name}) 4/4: Запуск (Awaken)...")
+            await update_status(f"⏳ ({clone_name}) 4/4: Запуск параметров сервера...")
             
-            # Step 1: Force Stop (already done at step 1, but user requested it again in sequence)
-            # await run_bash(f"su -c 'am force-stop com.roblox.{clone_name}'")
+            suffix = clone_name[-1].lower() if clone_name.lower().startswith("clien") else clone_name.lower()
             
-            # Step 3: Start the app (Awaken)
-            ret, stdout, stderr = await run_bash(f"su -c 'monkey -p com.roblox.{clone_name} 1'")
+            ret = -1
+            if place_id:
+                if link_code:
+                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}&linkCode={link_code}' -p com.roblox.clien{suffix}\""
+                else:
+                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}' -p com.roblox.clien{suffix}\""
+                ret, stdout, stderr = await run_bash(join_cmd)
+                
+                if ret != 0:
+                    logger.error(f"Intent fail for {clone_name}, falling back to monkey.")
             
             if ret != 0:
-                await update_status(f"❌ Monkey Error ({clone_name}):\n{stderr}")
-                return False
-
-            if place_id:
-                # Step 4: WAIT 6 SECONDS (ugPhone needs time)
-                await asyncio.sleep(6)
-                
-                # Step 5: Send the Join command (Strike)
-                import re
-                share_code = None
-                
-                # Safe Extraction (Regex)
-                match = re.search(r"code=([a-zA-Z0-9]+)", str(place_id))
-                if match:
-                    share_code = match.group(1)
-                
-                if share_code:
-                    # Universal Intent Format (roblox://)
-                    join_intent = f"roblox://navigation/share_links?code={share_code}&type=Server"
-                    join_cmd = f"su -c 'am start -W -a android.intent.action.VIEW -d \"{join_intent}\" com.roblox.{clone_name}'"
-                    ret, stdout, stderr = await run_bash(join_cmd)
-                    if ret != 0:
-                        logger.error(f"Join Intent fail for {clone_name}: {stderr}")
-                else:
-                    # Fallback to standard PlaceID or direct URL
-                    if str(place_id).isdigit():
-                        join_cmd = f"su -c 'am start -W -a android.intent.action.VIEW -d \"roblox://placeId={place_id}\" com.roblox.{clone_name}'"
-                    else:
-                        join_cmd = f"su -c 'am start -W -a android.intent.action.VIEW -d \"{place_id}\" com.roblox.{clone_name}'"
-                    
-                    ret, stdout, stderr = await run_bash(join_cmd)
-                
+                monkey_cmd = f"su -c \"monkey -p com.roblox.clien{suffix} -c android.intent.category.LAUNCHER 1\""
+                ret, stdout, stderr = await run_bash(monkey_cmd)
+                if ret != 0:
+                    await update_status(f"❌ Monkey Error ({clone_name}):\n{stderr}")
+                    return False
+            
             await update_status(f"✅ Запущено ({clone_name})")
             return True
                 

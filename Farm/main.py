@@ -626,10 +626,21 @@ class AegisBot:
             suffix = name[-1].lower() if name.startswith("clien") else name.lower()
             await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
 
-            # V5.0 Sequence: Cookie -> Launch only
-            urls = self.config.servers_list
+            import json, os
+            p_id, l_code = None, None
+            try:
+                cfg_path = os.path.join(FARM_DIR, f"{DEVICE_ID}.json")
+                if os.path.exists(cfg_path):
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        cdata = json.load(f)
+                        p_id = cdata.get("placeID")
+                        l_code = cdata.get("linkCode") or cdata.get("privateServerLink")
+            except Exception as e:
+                logger.error(f"Failed parsing server config: {e}")
+
+            # V6.0 Universal Launch Sequence
             ok = await InjectionEngine.inject_and_launch(
-                name, ci.get("cookie"), urls[0] if urls else None, sm)
+                name, ci.get("cookie"), p_id, l_code, sm)
 
             if ok:
                 self.set_state(name, CloneState.RUNNING)
