@@ -8,7 +8,7 @@ logger = logging.getLogger("InjectionEngine")
 
 class InjectionEngine:
     @staticmethod
-    def inject_and_launch(clone_name: str, cookie: str, place_id: str = None, link_code: str = None, status_msg=None) -> bool:
+    async def inject_and_launch(clone_name: str, cookie: str, place_id: str = None, link_code: str = None, status_msg=None) -> bool:
         """
         The strictly ordered, pure-bash injection mechanism.
         Возвращает True если запуск успешен, иначе False.
@@ -23,17 +23,17 @@ class InjectionEngine:
                     pass
 
         try:
-            # 1. Skip Cleanup (V5.0 SAFE MODE)
-            # await run_bash(f"su -c 'am force-stop com.roblox.{clone_name}'")
-
+            suffix = clone_name[-1].lower() if clone_name.lower().startswith("clien") else clone_name.lower()
+            pkg = f"com.roblox.clien{suffix}"
+            
             # 2. SQLite Injection (STRICT BASH)
             await update_status(f"⏳ ({clone_name}) 2/4: Инъекция Cookie (BASH)...")
             
             # Clean Journal Files
-            await run_bash(f"su -c 'rm -f /data/data/com.roblox.{clone_name}/app_webview/Default/Cookies-journal /data/data/com.roblox.{clone_name}/app_webview/Default/Cookies-wal'")
+            await run_bash(f"su -c 'rm -f /data/data/{pkg}/app_webview/Default/Cookies-journal /data/data/{pkg}/app_webview/Default/Cookies-wal'")
             
             sqlite_bin = "/data/data/com.termux/files/usr/bin/sqlite3"
-            db_path = f"/data/data/com.roblox.{clone_name}/app_webview/Default/Cookies"
+            db_path = f"/data/data/{pkg}/app_webview/Default/Cookies"
             
             # Calculate Timestamp in microseconds
             current_time = int(time.time() * 1000000)
@@ -55,7 +55,7 @@ class InjectionEngine:
 
             # 3. Permissions Fix (CRITICAL)
             await update_status(f"⏳ ({clone_name}) 3/4: Восстановление прав...")
-            chown_cmd = f"su -c \"chown \\$(stat -c %u:%g /data/data/com.roblox.{clone_name}) {db_path}\""
+            chown_cmd = f"su -c \"chown \\$(stat -c %u:%g /data/data/{pkg}) {db_path}\""
             ret, stdout, stderr = await run_bash(chown_cmd)
             
             # Recovery Force
@@ -71,21 +71,19 @@ class InjectionEngine:
             # 4. Launch (Monkey / Intent) (Golden Sequence)
             await update_status(f"⏳ ({clone_name}) 4/4: Запуск параметров сервера...")
             
-            suffix = clone_name[-1].lower() if clone_name.lower().startswith("clien") else clone_name.lower()
-            
             ret = -1
             if place_id:
                 if link_code:
-                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}&linkCode={link_code}' -p com.roblox.clien{suffix}\""
+                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}&linkCode={link_code}' -p {pkg}\""
                 else:
-                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}' -p com.roblox.clien{suffix}\""
+                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}' -p {pkg}\""
                 ret, stdout, stderr = await run_bash(join_cmd)
                 
                 if ret != 0:
                     logger.error(f"Intent fail for {clone_name}, falling back to monkey.")
             
             if ret != 0:
-                monkey_cmd = f"su -c 'monkey -p com.roblox.{clone_name} 1'"
+                monkey_cmd = f"su -c 'monkey -p {pkg} 1'"
                 ret, stdout, stderr = await run_bash(monkey_cmd)
                 if ret != 0:
                     await update_status(f"❌ Monkey Error ({clone_name}):\n{stderr}")
