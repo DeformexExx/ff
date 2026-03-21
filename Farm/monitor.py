@@ -1,10 +1,26 @@
 # -*- coding: utf-8 -*-
 import os
+import re
 import logging
 from typing import Optional
 from bash_utils import run_bash
 
 logger = logging.getLogger("MonitorEngine")
+
+
+async def clone_pgrep_alive(suffix: str) -> bool:
+    """
+    Liveness: pgrep -f com.roblox.clien{suffix} нашёл PID.
+    Дублируется как MonitorEngine.clone_pgrep_alive для совместимости.
+    Сначала su, затем pgrep без su (Termux).
+    """
+    pkg = f"com.roblox.clien{suffix}"
+    ret, out, _ = await run_bash(f"su -c 'pgrep -f {pkg}'")
+    if ret == 0 and out.strip():
+        return True
+    ret2, out2, _ = await run_bash(f"pgrep -f {pkg}")
+    return ret2 == 0 and bool(out2.strip())
+
 
 class MonitorEngine:
     @staticmethod
@@ -32,6 +48,18 @@ class MonitorEngine:
             pass
             
         return ram, cpu, temp
+
+    clone_pgrep_alive = staticmethod(clone_pgrep_alive)
+
+    @staticmethod
+    async def get_clone_cpu_percent(suffix: str) -> float:
+        """CPU % процесса по строке top (как в watchdog). -1 если не найдено."""
+        _, top_out, _ = await run_bash(
+            f"su -c \"top -n 1 -b | grep com.roblox.clien{suffix}\""
+        )
+        line = top_out.strip().splitlines()[0] if top_out.strip() else ""
+        m = re.search(r"(\d+(?:\.\d+)?)%", line)
+        return float(m.group(1)) if m else -1.0
 
     @staticmethod
     async def get_pid(suffix: str) -> Optional[str]:

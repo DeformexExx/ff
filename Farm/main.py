@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Aegis bot — V8.5
+# Aegis bot — V8.8
 import os
 import sys
 import enum
@@ -9,6 +9,7 @@ import time
 import tempfile
 import re
 import html
+import subprocess
 from typing import Optional, Dict, Tuple
 
 _bot_dir = os.path.dirname(os.path.abspath(__file__))
@@ -24,12 +25,39 @@ from telegram.error import TelegramError
 
 from config_manager      import ConfigManager
 from ui_manager          import UIManager
-from monitor             import MonitorEngine
+from monitor             import MonitorEngine, clone_pgrep_alive
 from injection_engine    import InjectionEngine
 from bash_utils          import run_bash
 from persistence_manager import PersistenceManager
 
-VERSION = "8.5"
+VERSION = "8.8"
+
+
+def apply_immortality() -> None:
+    """Anti-OOM: oom_score_adj, nice, termux-wake-lock (subprocess)."""
+    pid = os.getpid()
+    try:
+        subprocess.run(
+            ["su", "-c", f"echo -1000 > /proc/{pid}/oom_score_adj"],
+            capture_output=True,
+            timeout=15,
+        )
+    except Exception as e:
+        logger.warning(f"oom_score_adj: {e}")
+    try:
+        os.nice(-20)
+    except Exception as e:
+        logger.warning(f"nice(-20): {e}")
+    try:
+        subprocess.run(["termux-wake-lock"], capture_output=True, timeout=20)
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        logger.debug(f"termux-wake-lock: {e}")
+    tw = "/data/data/com.termux/files/usr/bin/termux-wake-lock"
+    if os.path.isfile(tw):
+        try:
+            subprocess.run([tw], capture_output=True, timeout=20)
+        except subprocess.SubprocessError as e:
+            logger.debug(f"wake-lock path: {e}")
 
 if len(sys.argv) < 2:
     print("❌  Usage: python main.py <DEVICE_ID>")
@@ -96,14 +124,14 @@ async def watchdog_safe_restart(
 async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
     """
     Тройная проверка (RUNNING):
-    1) Liveness — pgrep не находит процесс
-    2) Threads — th < 130 (после grace 120 с)
-    3) CPU — < 2% непрерывно 3 минуты при th >= 130
+    1) Процесс — clone_pgrep_alive False
+    2) Потоки — th < 130 (после grace 120 с)
+    3) CPU — < 2% непрерывно 120 с при th >= 130 (top)
     """
     GRACE_SEC = 120
     MIN_THREADS = 130
     CPU_FREEZE_PCT = 2.0
-    CPU_FREEZE_SEC = 180
+    CPU_FREEZE_SEC = 120
 
     while True:
         await asyncio.sleep(30)
@@ -118,7 +146,7 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                 suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
                 uptime = now - bot_instance.running_since.get(name, now)
 
-                alive = await MonitorEngine.clone_pgrep_alive(suffix)
+                alive = await clone_pgrep_alive(suffix)
                 if not alive:
                     logger.warning(f"Watchdog [{name}]: liveness fail")
                     await watchdog_safe_restart(
@@ -218,21 +246,6 @@ class AegisBot:
 
     async def _is_admin(self, uid: int) -> bool:
         return uid in self.config.admin_ids
-
-    async def _apply_immortality(self) -> None:
-        """OOM shield, max priority, wake lock (Termux)."""
-        pid = os.getpid()
-        r, _, err = await run_bash(f"su -c 'echo -1000 > /proc/{pid}/oom_score_adj'")
-        if r != 0:
-            logger.warning(f"oom_score_adj: {err}")
-        try:
-            os.nice(-20)
-        except Exception as e:
-            logger.warning(f"nice(-20): {e}")
-        await run_bash("termux-wake-lock 2>/dev/null || true")
-        tw = "/data/data/com.termux/files/usr/bin/termux-wake-lock"
-        if os.path.isfile(tw):
-            await run_bash(f"\"{tw}\" 2>/dev/null || true")
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update.effective_user.id): return
@@ -349,14 +362,20 @@ class AegisBot:
         async def collect_one(clone_name: str) -> Tuple[str, str, str, str, str]:
             name_disp = clone_name.replace("_", "-")
             sfx = clone_name[-1].lower() if clone_name.lower().startswith("clien") else clone_name.lower()
-            alive, st, cpu = await asyncio.gather(
-                MonitorEngine.clone_pgrep_alive(sfx),
-                MonitorEngine.get_clone_status(clone_name),
-                MonitorEngine.get_clone_cpu_percent(sfx),
-            )
-            m_thr = re.search(r"Thr:\s*(\d+)", st)
-            thr = int(m_thr.group(1)) if m_thr else 0
-            cpu_str = f"{cpu:.0f}" if cpu >= 0 else "—"
+            cpu = -1.0
+            try:
+                alive, st, cpu = await asyncio.gather(
+                    clone_pgrep_alive(sfx),
+                    MonitorEngine.get_clone_status(clone_name),
+                    MonitorEngine.get_clone_cpu_percent(sfx),
+                )
+                m_thr = re.search(r"Thr:\s*(\d+)", st)
+                thr = int(m_thr.group(1)) if m_thr else 0
+                cpu_str = f"{cpu:.0f}" if cpu >= 0 else "—"
+            except Exception as e:
+                logger.error(f"hub collect_one [{clone_name}]: {e}")
+                alive, thr, cpu_str = False, 0, "—"
+                cpu = -1.0
             self.clone_states[f"{clone_name}:threads"] = str(thr)
             self.clone_states[f"{clone_name}:cpu"] = cpu_str
             cstate = self.clone_states.get(clone_name, CloneState.STOPPED)
@@ -418,7 +437,7 @@ class AegisBot:
 
         pid_sfx = suffix[-1].lower() if suffix.startswith("clien") else suffix.lower()
         alive, st, cpu = await asyncio.gather(
-            MonitorEngine.clone_pgrep_alive(pid_sfx),
+            clone_pgrep_alive(pid_sfx),
             MonitorEngine.get_clone_status(clone_name),
             MonitorEngine.get_clone_cpu_percent(pid_sfx),
         )
@@ -810,6 +829,7 @@ class AegisBot:
 
     async def run(self):
         logger.info(f"Aegis V{VERSION} start — {DEVICE_ID}")
+        apply_immortality()
 
         self.application = ApplicationBuilder().token(self.config.bot_token).build()
         app = self.application
@@ -826,8 +846,6 @@ class AegisBot:
 
         await app.initialize()
         await app.start()
-
-        await self._apply_immortality()
 
         asyncio.create_task(watchdog_loop(app, self))
 
