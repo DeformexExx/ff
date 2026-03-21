@@ -124,12 +124,18 @@ class UIManager:
             acc_esc = html.escape(active_acc)
             thr_esc = html.escape(thr_info)
 
-            if state == "RUNNING":
-                msg += f"🟢 {suffix} | {thr_esc} th | Актив: {acc_esc}\n"
-            elif state == "STARTING":
+            thr_val = 0
+            try:
+                thr_val = int(thr_info)
+            except:
+                pass
+
+            if state == "STARTING":
                 msg += f"⏳ {suffix} | Loading....\n"
+            elif state == "RUNNING" and thr_val >= 10:
+                msg += f"🟢 {suffix} | {thr_esc} th | Актив: {acc_esc}\n"
             else:
-                msg += f"🔴 {suffix} | Offline | Актив: {acc_esc}\n"
+                msg += f"🔴 {suffix} | Offline\n"
 
         return msg.rstrip()
 

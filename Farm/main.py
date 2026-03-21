@@ -455,11 +455,11 @@ class AegisBot:
             elif d == "sys_help": await q.message.reply_text(UIManager.get_help_text(), parse_mode="HTML")
             
             elif d == "mass_start":
-                asyncio.create_task(self._mass_start(chat_id))
-                await q.message.reply_text("🚀 Массовый запуск инициирован...", parse_mode="HTML")
+                asyncio.create_task(self._mass_start(chat))
+                await q.message.reply_text("🚀 Запуск фермы инициирован... Чистка кэша завершена.", parse_mode="HTML")
 
             elif d == "mass_stop":
-                asyncio.create_task(self._mass_stop(chat_id))
+                asyncio.create_task(self._mass_stop(chat))
                 await q.message.reply_text("🛑 Массовая остановка инициирована...", parse_mode="HTML")
 
             elif d.startswith("start_"):
@@ -582,47 +582,53 @@ class AegisBot:
         clones = [c for c in self.config.clones_data if c.get("active", True)]
         
         app = self.application
-        if chat_id and app:
-            try:
-                await app.bot.send_message(chat_id, "🧹 <b>Очистка кэша перед массовым стартом...</b>", parse_mode="HTML")
-            except Exception: pass
+        if not (chat_id and app): return
+
+        try:
+            m = await app.bot.send_message(chat_id, "🚀 <b>Запуск фермы инициирован...</b>", parse_mode="HTML")
             
-        for c in clones:
-            name = c.get("name")
-            if name:
-                suffix = name[-1].lower() if name.startswith("clien") else name.lower()
-                await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
+            # Step 1: Wipe Cache
+            await m.edit_text("🚀 <b>Запуск фермы инициирован...</b>\n🧹 <i>Очистка кэша...</i>", parse_mode="HTML")
+            for c in clones:
+                name = c.get("name")
+                if name:
+                    suffix = name[-1].lower() if name.startswith("clien") else name.lower()
+                    await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
+            
+            await m.edit_text("🚀 <b>Запуск фермы инициирован... Чистка кэша завершена.</b>", parse_mode="HTML")
                 
-        for idx, c in enumerate(clones, 1):
-            name = c.get("name")
-            if not name: continue
-            if chat_id and app:
-                try:
-                    await app.bot.send_message(
-                        chat_id,
-                        f"🚀 <b>Queue [{idx}/{len(clones)}]</b>: <code>{html.escape(name)}</code>",
-                        parse_mode="HTML"
-                    )
-                except Exception:
-                    pass
-            await self._enqueue_start(name, chat_id)
+            for idx, c in enumerate(clones, 1):
+                name = c.get("name")
+                if not name: continue
+                await app.bot.send_message(
+                    chat_id,
+                    f"🚀 <b>Queue [{idx}/{len(clones)}]</b>: <code>{html.escape(name)}</code>",
+                    parse_mode="HTML"
+                )
+                await self._enqueue_start(name, chat_id)
+        except Exception as e:
+            logger.error(f"Mass Start Error: {e}")
 
     async def _mass_stop(self, chat_id):
         """Sequential mass stop."""
         app = self.application
-        if chat_id and app:
-            try:
-                await app.bot.send_message(chat_id, "🛑 <b>МАСС СТОП: остановка всех...</b>", parse_mode="HTML")
-            except Exception: pass
+        if not (chat_id and app): return
+
+        try:
+            m = await app.bot.send_message(chat_id, "🛑 <b>МАСС СТОП: остановка всех...</b>", parse_mode="HTML")
             
-        for c in self.config.clones_data:
-            name = c.get("name")
-            if not name: continue
-            suffix = name[-1].lower() if name.startswith("clien") else name.lower()
-            await run_bash(f"su -c 'am force-stop com.roblox.clien{suffix}'")
-            self.set_state(name, CloneState.STOPPED)
-            self.persistence.remove_target(name)
-            self.config.update_clone_status(name, "OFFLINE")
+            for c in self.config.clones_data:
+                name = c.get("name")
+                if not name: continue
+                suffix = name[-1].lower() if name.startswith("clien") else name.lower()
+                await run_bash(f"su -c 'am force-stop com.roblox.clien{suffix}'")
+                self.set_state(name, CloneState.STOPPED)
+                self.persistence.remove_target(name)
+                self.config.update_clone_status(name, "OFFLINE")
+
+            await m.edit_text("🛑 <b>МАСС СТОП: все процессы завершены.</b>", parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Mass Stop Error: {e}")
 
         await self.refresh_dashboard(force=True)
 
