@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Aegis MonitorEngine — V10.0
+# Aegis MonitorEngine — V10.1 Ghost Killer
 import os
 import re
 import logging
@@ -11,15 +11,33 @@ logger = logging.getLogger("MonitorEngine")
 
 async def clone_pgrep_alive(suffix: str) -> bool:
     """
-    Liveness check: pgrep -f com.roblox.clien{suffix} found a PID.
-    Tries su first, then plain pgrep (Termux fallback).
+    STRICT liveness check via ps -A.
+    Process is considered alive only when:
+      - It appears in ps -A for com.roblox.clien{suffix}
+      - Its status column is NOT 'Z' (zombie)
+    Falls back to plain pgrep if su fails.
+    Groups commands into a single su -c call.
     """
     pkg = f"com.roblox.clien{suffix}"
-    ret, out, _ = await run_bash(f"su -c 'pgrep -f {pkg}'")
-    if ret == 0 and out.strip():
-        return True
-    ret2, out2, _ = await run_bash(f"pgrep -f {pkg}")
-    return ret2 == 0 and bool(out2.strip())
+    # Single grouped su call: ps -A + filter
+    _, out, _ = await run_bash(
+        f"su -c \"ps -A | grep {pkg} | grep -v grep\""
+    )
+    if out.strip():
+        for line in out.strip().splitlines():
+            cols = line.split()
+            # ps -A columns: USER PID PPID VSZ RSS WCHAN ADDR S NAME
+            # Status (S) column is index 7; if 'Z' → zombie
+            if len(cols) >= 8:
+                status_col = cols[7].upper()
+                if "Z" not in status_col:
+                    return True
+            else:
+                # Unexpected format — trust it's alive
+                return True
+    # Fallback: plain pgrep without su
+    _, out2, _ = await run_bash(f"pgrep -f {pkg}")
+    return bool(out2.strip())
 
 
 class MonitorEngine:
@@ -89,56 +107,58 @@ class MonitorEngine:
     @staticmethod
     async def get_pid(suffix: str) -> Optional[str]:
         """
-        Strict PID discovery: pgrep first (fast), then ps -A fallback.
-        Returns string PID or None.
+        Strict PID: grouped single su call — pgrep + ps fallback in one shot.
+        Returns non-zombie PID string or None.
         """
         pkg = f"com.roblox.clien{suffix}"
-        # Fast path via pgrep
-        _, pg_out, _ = await run_bash(f"su -c 'pgrep -f {pkg} | head -n 1'")
+        # One su call: pgrep fast path
+        _, pg_out, _ = await run_bash(
+            f"su -c 'pgrep -f {pkg} | head -n 1'"
+        )
         pid = pg_out.strip().splitlines()[0].strip() if pg_out.strip() else ""
         if pid and pid.isdigit():
             return pid
-        # Fallback: ps -A
-        _, stdout, _ = await run_bash(
-            f"su -c 'ps -A | grep {pkg} | grep -v grep'"
+        # One su call: ps -A fallback, skip zombies
+        _, ps_out, _ = await run_bash(
+            f"su -c \"ps -A | grep {pkg} | grep -v grep\""
         )
-        output = stdout.strip()
-        if output:
-            try:
-                return output.split()[1]
-            except IndexError:
-                pass
+        for line in ps_out.strip().splitlines():
+            cols = line.split()
+            if len(cols) >= 8 and "Z" not in cols[7].upper():
+                try:
+                    return cols[1]  # PID column
+                except IndexError:
+                    pass
         return None
 
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
     async def get_threads(pid: str) -> int:
         """
-        Thread count via /proc/{pid}/status Threads field (most reliable).
-        Falls back to ls /proc/{pid}/task | wc -l.
+        Thread count — single su call reads status + task dir in one shot.
         Returns 0 on any failure.
         """
         if not pid or not str(pid).isdigit():
             return 0
-        # Primary: /proc/{pid}/status Threads line
+        # Grouped: try Threads from /proc/status; pipe to grep
         _, stdout, _ = await run_bash(
-            f"su -c \"cat /proc/{pid}/status | grep Threads\""
+            f"su -c \"grep Threads /proc/{pid}/status 2>/dev/null || ls /proc/{pid}/task 2>/dev/null | wc -l\""
         )
         raw = stdout.strip()
-        if raw:
-            m = re.search(r"Threads:\s*(\d+)", raw)
-            if m:
-                try:
-                    return int(m.group(1))
-                except ValueError:
-                    pass
-        # Fallback: task directory count
-        _, stdout2, _ = await run_bash(f"su -c \"ls /proc/{pid}/task | wc -l\"")
-        raw2 = stdout2.strip()
-        if not raw2 or any(e in raw2.lower() for e in ("no such", "denied")):
+        if not raw:
             return 0
+        # If result is "Threads:\t142" style
+        m = re.search(r"Threads:\s*(\d+)", raw)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                pass
+        # Otherwise it's the wc -l count
+        lines = raw.splitlines()
+        last = lines[-1].strip()
         try:
-            return int(raw2)
+            return int(last)
         except ValueError:
             return 0
 

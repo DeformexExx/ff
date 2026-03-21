@@ -215,6 +215,7 @@ class AegisBot:
         self._start_lock = asyncio.Lock()
         self.is_mass_starting = False
         self.watchdog_cpu_low_since: Dict[str, Optional[float]] = {}
+        self._last_sync_ts: float = 0.0  # timestamp of last hub refresh
 
         for c in self.config.clones_data:
             n = c.get("name")
@@ -446,6 +447,12 @@ class AegisBot:
         except Exception:
             state_map["__ram_free__"] = "N/A"
 
+        # Inject Last Sync timestamp
+        self._last_sync_ts = time.time()
+        import datetime as _dt
+        sync_str = _dt.datetime.fromtimestamp(self._last_sync_ts).strftime("%H:%M:%S")
+        state_map["__last_sync__"] = sync_str
+
         text = UIManager.format_clones_hub(self.config.clones_data, state_map, VERSION)
         return text, state_map
 
@@ -635,51 +642,62 @@ class AegisBot:
 
         current = self.clone_states.get(name, CloneState.STOPPED)
         if current == CloneState.STARTING:
-            logger.info(f"_enqueue_start: [{name}] already STARTING. Skip.")
             return
 
         async with self._start_lock:
-            self.set_state(name, CloneState.STARTING)
-            status_str = await MonitorEngine.get_clone_status(name)
-            if "Offline" not in status_str:
-                logger.info(f"{name}: процесс уже есть, пропуск инъекции.")
+            suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
+            pkg = f"com.roblox.clien{suffix}"
+
+            # ── GK: Ghost Killer — strict liveness via ps -A (zombie-aware) ──
+            alive = await clone_pgrep_alive(suffix)
+            if alive:
+                # Process is genuinely running — mark it and skip injection
                 self.set_state(name, CloneState.RUNNING)
                 app = self.application
                 if chat_id and app:
                     try:
-                        n_esc = html.escape(name)
                         await app.bot.send_message(
-                            chat_id, f"👁 <code>{n_esc}</code> уже запущен.", parse_mode="HTML")
+                            chat_id,
+                            f"👁 <code>{html.escape(name.replace('_','-'))}</code> уже запущен.",
+                            parse_mode="HTML")
                     except Exception: pass
                 return
+
+            # If JSON said RUNNING but process is dead → auto-correct to IDLE
+            if self.clone_states.get(name) == CloneState.RUNNING:
+                self.set_state(name, CloneState.STOPPED)
+
+            self.set_state(name, CloneState.STARTING)
 
             sm = None
             app = self.application
             if chat_id and app:
                 try:
-                    name_esc = html.escape(name.replace('_', '-'))
                     sm = await app.bot.send_message(
-                        chat_id, f"▶️ <code>{name_esc}</code>", parse_mode="HTML")
+                        chat_id,
+                        f"▶️ <code>{html.escape(name.replace('_','-'))}</code>",
+                        parse_mode="HTML")
                 except Exception:
                     pass
 
-            suffix = name[-1].lower() if name.startswith("clien") else name.lower()
-            # Deep clean before every launch
-            await run_bash("su -c 'sync'")
-            await run_bash('su -c "echo 3 > /proc/sys/vm/drop_caches"')
-            await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
+            # ── GK: Force-stop phantom before launch + grouped deep clean ──
+            await run_bash(
+                f"su -c 'am force-stop {pkg}; sync; echo 3 > /proc/sys/vm/drop_caches; "
+                f"rm -rf /data/data/{pkg}/cache/*'"
+            )
+            await asyncio.sleep(1)
 
-            import json, os
+            import json as _json
             p_id, l_code = None, None
             try:
                 cfg_path = os.path.join(FARM_DIR, f"{DEVICE_ID}.json")
                 if os.path.exists(cfg_path):
                     with open(cfg_path, "r", encoding="utf-8") as f:
-                        cdata = json.load(f)
+                        cdata = _json.load(f)
                         p_id = cdata.get("placeID")
                         l_code = cdata.get("linkCode") or cdata.get("privateServerLink")
             except Exception as e:
-                logger.error(f"Failed parsing server config: {e}")
+                logger.error(f"server config read error: {e}")
 
             ok = await InjectionEngine.inject_and_launch(
                 name, ci.get("cookie"), p_id, l_code, sm)
@@ -691,17 +709,19 @@ class AegisBot:
                 self.set_state(name, CloneState.STOPPED)
 
         await asyncio.sleep(10)
-
         await self.refresh_dashboard(force=True)
 
     async def _do_deep_clean(self) -> None:
-        """Global deep clean: sync + drop_caches. Safe to call anytime."""
-        await run_bash("su -c 'sync'")
-        await run_bash('su -c "echo 3 > /proc/sys/vm/drop_caches"')
-        logger.info("Deep clean: drop_caches done.")
+        """Global deep clean: grouped single su call."""
+        await run_bash("su -c 'sync; echo 3 > /proc/sys/vm/drop_caches'")
 
     async def _mass_start(self, chat_id):
-        """Staggered mass start: one clone every 45 s to avoid RAM spikes."""
+        """
+        Staggered V2 mass start:
+        1. pkill -9 all roblox processes
+        2. Reset ALL clone statuses to IDLE in JSON
+        3. Launch one by one with 45s gap + deep clean before each
+        """
         STAGGER_SEC = 45
         self.is_mass_starting = True
         clones = [c for c in self.config.clones_data if c.get("active", True)]
@@ -710,10 +730,19 @@ class AegisBot:
         if not (chat_id and app): return
 
         try:
-            m = await app.bot.send_message(chat_id, "▶️ Массовый запуск…", parse_mode="HTML")
-            # Global deep clean before batch
-            await m.edit_text("🧹 Deep clean…", parse_mode="HTML")
-            await self._do_deep_clean()
+            m = await app.bot.send_message(chat_id, "🚀 Staggered Start V2…", parse_mode="HTML")
+
+            # Step 1: kill everything
+            await m.edit_text("☠️ pkill -9 all roblox…", parse_mode="HTML")
+            await run_bash("su -c 'pkill -9 com.roblox'")
+            await asyncio.sleep(2)
+
+            # Step 2: reset all JSON statuses to idle in one pass
+            for c in self.config.clones_data:
+                n = c.get("name")
+                if n:
+                    self.set_state(n, CloneState.STOPPED)
+
             await m.edit_text(f"▶️ Запуск {len(clones)} клонов (пауза {STAGGER_SEC}с)…", parse_mode="HTML")
 
             for idx, c in enumerate(clones, 1):
@@ -728,7 +757,6 @@ class AegisBot:
                     parse_mode="HTML",
                 )
                 await self._enqueue_start(name, chat_id)
-                # Stagger — wait between clones (skip after the last one)
                 if idx < len(clones) and self.is_mass_starting:
                     await asyncio.sleep(STAGGER_SEC)
         except Exception as e:
@@ -737,23 +765,30 @@ class AegisBot:
             self.is_mass_starting = False
 
     async def _mass_stop(self, chat_id):
-        """Sequential mass stop with instant interrupt."""
+        """
+        Mass stop — grouped single su call: force-stop all + pkill.
+        Resets all statuses to IDLE immediately.
+        """
         self.is_mass_starting = False
         app = self.application
         if not (chat_id and app): return
 
         try:
             m = await app.bot.send_message(chat_id, "🛑 Остановка…", parse_mode="HTML")
-            
-            await run_bash('su -c "pkill -9 com.roblox"')
-            
+
+            # Reset all bot states immediately
             for c in self.config.clones_data:
-                name = c.get("name")
-                if not name: continue
-                suffix = name[-1].lower() if name.startswith("clien") else name.lower()
-                await run_bash(f"su -c 'am force-stop com.roblox.clien{suffix}'")
-                self.set_state(name, CloneState.STOPPED)
-                self.persistence.remove_target(name)
+                n = c.get("name")
+                if n:
+                    self.set_state(n, CloneState.STOPPED)
+                    self.persistence.remove_target(n)
+
+            # Build one grouped su -c command for all force-stops
+            stops = "; ".join(
+                f"am force-stop com.roblox.clien{c.get('name', '')[-1].lower()}"
+                for c in self.config.clones_data if c.get("name")
+            )
+            await run_bash(f"su -c 'pkill -9 com.roblox; {stops}'")
 
             await m.edit_text("🛑 Готово.", parse_mode="HTML")
         except Exception as e:

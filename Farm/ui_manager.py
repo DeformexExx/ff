@@ -75,9 +75,11 @@ class UIManager:
 
         SEP = "━━━━━━━━━━━━━━━━━━━━"
         ram_free = state_map.get("__ram_free__", "N/A")
+        last_sync = state_map.get("__last_sync__", "—")
 
         header = (
             f"💎 <b>AEGIS OS V{_version}</b> | 🧠 RAM: <b>{html.escape(ram_free)}</b>\n"
+            f"♻️ Last Sync: <code>{html.escape(last_sync)}</code>\n"
             f"{SEP}\n"
             f"<code>ID  STATUS    ACCOUNT      TH    CPU</code>"
         )
