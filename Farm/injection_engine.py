@@ -8,7 +8,7 @@ logger = logging.getLogger("InjectionEngine")
 
 class InjectionEngine:
     @staticmethod
-    async def inject_and_launch(clone_name: str, cookie: str, place_id: str = None, link_code: str = None, status_msg=None) -> bool:
+    async def inject_and_launch(clone_name: str, cookie: str, server_link: str = None, status_msg=None) -> bool:
         """
         The strictly ordered, pure-bash injection mechanism.
         Возвращает True если запуск успешен, иначе False.
@@ -72,15 +72,14 @@ class InjectionEngine:
             await update_status(f"⏳ ({clone_name}) 4/4: Запуск параметров сервера...")
             
             ret = -1
-            if place_id:
-                if link_code:
-                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}&linkCode={link_code}' -p {pkg}\""
-                else:
-                    join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d 'roblox://placeID={place_id}' -p {pkg}\""
+            if server_link:
+                join_cmd = f"su -c \"am start -a android.intent.action.VIEW -d '{server_link}' {pkg}\""
                 ret, stdout, stderr = await run_bash(join_cmd)
                 
                 if ret != 0:
                     logger.error(f"Intent fail for {clone_name}, falling back to monkey.")
+            else:
+                await update_status(f"❌ Ссылка на сервер не найдена в server.json")
             
             if ret != 0:
                 monkey_cmd = f"su -c 'monkey -p {pkg} 1'"

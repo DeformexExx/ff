@@ -493,7 +493,7 @@ class AegisBot:
 
             elif d.startswith("start_single_"):
                 name = d[13:]
-                asyncio.create_task(self._start_single(name, chat))
+                asyncio.create_task(self._purge_restart(name, chat))
 
             elif d.startswith("stop_single_"):
                 name = d[12:]
@@ -511,13 +511,23 @@ class AegisBot:
 
             elif d.startswith("clone_"):
                 c_name = d[6:]
-                name = "Unknown"
-                for c in self.config.clones_data:
-                    if c.get("name") == c_name:
-                        name = c.get("account", "Not Set")
-                        break
+                name_acc = "Unknown"
                 
-                # V6.0 Calibration: If threads > 130, assume RUNNING automatically
+                try:
+                    import json, os
+                    cfg_path = os.path.join(FARM_DIR, f"{DEVICE_ID}.json")
+                    if os.path.exists(cfg_path):
+                        with open(cfg_path, "r", encoding="utf-8") as f:
+                            cdata = json.load(f)
+                            for c in cdata.get("clones", []):
+                                if c.get("name") == c_name:
+                                    name_acc = c.get("account", "Unknown")
+                                    if name_acc == "Unknown" and c.get("nickname"):
+                                        name_acc = c.get("nickname")
+                                    break
+                except Exception:
+                    pass
+                
                 suffix = c_name[-1].upper() if c_name.lower().startswith("clien") else c_name.upper()
                 pid = await MonitorEngine.get_pid(suffix)
                 thr = await MonitorEngine.get_threads(pid) if pid else 0
@@ -525,11 +535,11 @@ class AegisBot:
                 if thr > 130:
                     self.set_state(c_name, CloneState.RUNNING)
                 elif thr == 0:
-                    # Enforce stopped if process is dead
                     self.set_state(c_name, CloneState.STOPPED)
                 
                 name_esc  = html.escape(c_name.replace('_', '-'))
-                acc_esc   = html.escape(name.replace('_', '-'))
+                acc_esc   = html.escape(name_acc.replace('_', '-'))
+                
                 raw_state = self.clone_states.get(c_name, CloneState.STOPPED)
                 state_val = str(raw_state)
                 
@@ -543,12 +553,13 @@ class AegisBot:
                 text = f"⚙️ <b>{name_esc.upper()}</b>\n"
                 text += f"👤 Аккаунт: <code>{acc_esc}</code>\n"
                 text += f"Статус: <b>{status_rus}</b>\n"
-                text += f"Потоки: <code>{thr}</code>"
+                text += f"Потоки: <code>{thr} th</code>"
                 
                 await context.bot.send_message(
                     chat,
                     text,
-                    reply_markup=kb, parse_mode="HTML"
+                    reply_markup=kb,
+                    parse_mode="HTML"
                 )
 
             elif d == "maint_toggle":
