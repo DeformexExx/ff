@@ -268,14 +268,38 @@ class AegisBot:
 
     async def cmd_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update.effective_user.id): return
-        msg = await update.message.reply_text("🔄 Updating system (git pull)...")
-        ret, out, err = await run_bash(f"git -C {_bot_dir} pull")
-        req_path = os.path.join(_bot_dir, "requirements.txt")
-        if os.path.exists(req_path):
-            await msg.edit_text("🔄 Updating dependencies...")
-            await run_bash(f"pip install -r {req_path}")
-        await msg.edit_text("✅ Update complete. Restarting bot...\n\nGit:\n" + str(out)[:500])
-        os.execv(sys.executable, ['python'] + sys.argv)
+        msg = await update.message.reply_text("🔄 *Hard Update Sequence Started...*", parse_mode="Markdown")
+        
+        try:
+            # 1. Hard Reset (V6.0 Robust)
+            await msg.edit_text("🛰 (1/4) Fetching & Hard Resetting...")
+            await run_bash(f"git -C {_bot_dir} fetch --all")
+            await run_bash(f"git -C {_bot_dir} reset --hard origin/main")
+            await run_bash(f"git -C {_bot_dir} pull origin main")
+
+            # 2. Cache Clean
+            await msg.edit_text("🧹 (2/4) Purging __pycache__ directories...")
+            await run_bash(f'find {_bot_dir} -type d -name "__pycache__" -exec rm -rf {{}} +')
+
+            # 3. Dependencies
+            req_path = os.path.join(_bot_dir, "requirements.txt")
+            if os.path.exists(req_path):
+                await msg.edit_text("📦 (3/4) Syncing requirements.txt...")
+                await run_bash(f"pip install -r {req_path}")
+
+            # 4. Feedback & Final Restart
+            await msg.edit_text("✅ *Файлы обновлены, кэш очищен. Перезагрузка...*", parse_mode="Markdown")
+            await asyncio.sleep(2)
+            
+            # Re-exec process to apply changes immediately
+            os.execv(sys.executable, ['python'] + sys.argv)
+            
+        except Exception as e:
+            logger.error(f"Update Module Error: {e}")
+            if msg:
+                try:
+                    await msg.edit_text(f"❌ *Update Failed*: `{e}`", parse_mode="Markdown")
+                except Exception: pass
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_admin(update.effective_user.id): return
