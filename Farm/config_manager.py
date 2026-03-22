@@ -1,98 +1,76 @@
 # -*- coding: utf-8 -*-
-import os
+# config_manager.py — Aegis V11.0
 import json
+import os
 import logging
 
 logger = logging.getLogger("ConfigManager")
 
+
 class ConfigManager:
+    """Loads config.json + DEV_{id}.json, provides clone data & admin IDs."""
+
     def __init__(self, device_id: str, farm_dir: str):
         self.device_id = device_id
         self.farm_dir = farm_dir
-        self.config_file = os.path.join(farm_dir, f"{device_id}.json")
-        self.bot_token_file = os.path.join(farm_dir, "config.json")
-        self.servers_file = os.path.join(farm_dir, "servers.json")
-        
-        self.bot_token = ""
-        self.admin_ids = []
-        self.clones_data = []
-        self.servers_list = []
-        
+        self._cfg_path = os.path.join(farm_dir, "config.json")
+        self._dev_path = os.path.join(farm_dir, f"{device_id}.json")
+
+        self.bot_token: str = ""
+        self.admin_ids: list = []
+        self.clones_data: list = []
+        self._raw_cfg: dict = {}
+        self._raw_dev: dict = {}
+
         self.reload()
 
+    # ──────────────────────────────────────────────────────────────────────
     def reload(self):
-        """Перезагружает все конфигурационные файлы с диска"""
-        self._load_bot_config()
-        self._load_clones_config()
-        self._load_servers_list()
-        logger.info("Configs reloaded successfully.")
+        """(Re)load both config.json and DEV_{id}.json."""
+        # ── config.json ──
+        try:
+            with open(self._cfg_path, "r", encoding="utf-8") as f:
+                self._raw_cfg = json.load(f)
+            self.bot_token = self._raw_cfg.get("bot_token", "")
+            self.admin_ids = self._raw_cfg.get("admin_ids", [])
+        except Exception as e:
+            logger.error(f"config.json load error: {e}")
 
-    def _load_servers_list(self):
-        if os.path.exists(self.servers_file):
+        # ── DEV_{id}.json ──
+        if os.path.exists(self._dev_path):
             try:
-                with open(self.servers_file, "r", encoding="utf-8") as f:
-                    self.servers_list = json.load(f)
-                    if not isinstance(self.servers_list, list):
-                        self.servers_list = [self.servers_list] if self.servers_list else []
+                with open(self._dev_path, "r", encoding="utf-8") as f:
+                    self._raw_dev = json.load(f)
+                self.clones_data = self._raw_dev.get("clones", [])
             except Exception as e:
-                logger.error(f"Failed to load servers list: {e}")
-                self.servers_list = []
+                logger.error(f"DEV json load error: {e}")
         else:
-            logger.warning(f"Servers file not found: {self.servers_file}")
-            self.servers_list = []
+            logger.warning(f"DEV file not found: {self._dev_path}")
 
-    def _load_bot_config(self):
-        if os.path.exists(self.bot_token_file):
-            try:
-                with open(self.bot_token_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    self.bot_token = data.get("bot_token", "")
-                    self.admin_ids = data.get("admin_ids", [])
-            except Exception as e:
-                logger.error(f"Failed to load user bot config: {e}")
-        else:
-            logger.warning(f"Bot config not found: {self.bot_token_file}")
-
-    def _load_clones_config(self):
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    # {DEVICE_ID}.json might wrap clones in "clones" key or be a list
-                    self.clones_data = data.get("clones", []) if isinstance(data, dict) else data
-            except Exception as e:
-                logger.error(f"Failed to parse clones JSON: {e}")
-        else:
-            logger.warning(f"Clones config file not found: {self.config_file}")
-            self.clones_data = []
-
-    def get_clone(self, clone_name: str) -> dict:
-        """Возвращает словарь с данными клона по имени"""
+    # ──────────────────────────────────────────────────────────────────────
+    def get_clone(self, name: str) -> dict | None:
         for c in self.clones_data:
-            if c.get("name") == clone_name:
+            if c.get("name") == name:
                 return c
-        return {}
+        return None
 
-    def update_clone_status(self, clone_name: str, status: str):
-        """Обновляет статус клона и сохраняет в DEV_2.json (config_file)"""
-        updated = False
+    # ──────────────────────────────────────────────────────────────────────
+    def update_clone_status(self, name: str, status: str):
+        """Write status into DEV_{id}.json for the given clone."""
+        changed = False
         for c in self.clones_data:
-            if c.get("name") == clone_name:
-                c["status"] = status
-                updated = True
+            if c.get("name") == name:
+                c["status"] = status.lower()
+                changed = True
                 break
-        
-        if updated and os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                
-                if isinstance(data, dict) and "clones" in data:
-                    data["clones"] = self.clones_data
-                else:
-                    data = self.clones_data
-                    
-                with open(self.config_file, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=4)
-            except Exception as e:
-                logger.error(f"Failed to update clone status in config: {e}")
+        if changed:
+            self._save_dev()
+
+    # ──────────────────────────────────────────────────────────────────────
+    def _save_dev(self):
+        try:
+            self._raw_dev["clones"] = self.clones_data
+            with open(self._dev_path, "w", encoding="utf-8") as f:
+                json.dump(self._raw_dev, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logger.error(f"DEV json save error: {e}")

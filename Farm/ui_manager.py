@@ -1,3 +1,7 @@
+# -*- coding: utf-8 -*-
+# ui_manager.py — Aegis V11.0 (Net-Pulse UI)
+# CON column: >15 → Green, 8-14 → White, ≤5 → Blinking Red 🔴
+# AutoResume: ENABLED indicator in header
 import html
 from typing import Any
 from telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,24 +19,55 @@ def _hub_emoji(state: str, healthy: bool) -> str:
     if s == "STARTING":
         return "⏳"
     if s == "RUNNING" and healthy:
-        return "🟢"   # ACTIVE: ≥45 TCP
+        return "🟢"   # ACTIVE: ≥8 TCP
     if s == "RUNNING":
-        return "🟡"   # LOADING: 1-44 TCP
+        return "🟡"   # LOADING / not yet healthy
     return "🔴"       # IDLE / STOPPED
 
 
 def _tcp_status_label(con_val: int, state: str) -> str:
-    """V10.6 TCP-based status label for hub display."""
+    """
+    V11.0 Net-Pulse TCP-based status label.
+    RULE: If CON > 0 → NEVER return "IDLE".
+    If TH shows 0 but CON exists → ignore TH, classify by CON.
+    """
     s = str(state).upper()
     if s == "STARTING":
         return "START…"
+    # Net-Pulse rule: CON > 0 means NOT idle, regardless of state
+    if con_val > 0:
+        if con_val >= 8:
+            return "ACTIVE"    # healthy: ≥8 TCP
+        if con_val >= 6:
+            return "LOAD…"     # connecting: 6-7
+        return "ZOMBIE"        # frozen: 1-5
     if s != "RUNNING":
         return "IDLE"
-    if con_val >= 45:
-        return "ACTIVE"
+    return "IDLE"
+
+
+def _con_display(con_val: int, state: str) -> str:
+    """
+    V11.0 CON column with color indicators:
+    >15  → 🟢 Green (excellent)
+    8-14 → ⚪ White (normal ACTIVE)
+    ≤5   → 🔴❗ Blinking/flashing red (ZOMBIE — danger)
+    6-7  → 🟡 Yellow (loading)
+    0    → —
+    """
+    s = str(state).upper()
+    if s not in ("RUNNING", "STARTING") and con_val == 0:
+        return "—"
+    # Net-Pulse: if CON > 0, always show regardless of state
+    if con_val > 15:
+        return f"🟢{con_val}"
+    if con_val >= 8:
+        return f"⚪{con_val}"
+    if con_val >= 6:
+        return f"🟡{con_val}"
     if con_val >= 1:
-        return "LOADING"
-    return "STUCK"
+        return f"🔴❗{con_val}"   # Blinking red indicator for ZOMBIE
+    return "—"
 
 
 class UIManager:
@@ -77,7 +112,7 @@ class UIManager:
         return InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton(f"Консоль: {c}", callback_data="toggle_console")],
-                [InlineKeyboardButton(f"Автовосстановление: {r}", callback_data="toggle_restore")],
+                [InlineKeyboardButton(f"AutoResume: {r}", callback_data="toggle_restore")],
                 [InlineKeyboardButton("⬅️ В меню", callback_data="nav_home")],
             ]
         )
@@ -90,9 +125,12 @@ class UIManager:
         SEP = "━━━━━━━━━━━━━━━━━━━━"
         ram_free = state_map.get("__ram_free__", "N/A")
         last_sync = state_map.get("__last_sync__", "—")
+        auto_resume = state_map.get("__auto_resume__", "ENABLED")
 
         header = (
-            f"💎 <b>AEGIS OS V{_version}</b> | 🧠 RAM: <b>{html.escape(ram_free)}</b>\n"
+            f"💎 <b>AEGIS OS V{_version}</b> · <b>Net-Pulse</b>\n"
+            f"🧠 RAM: <b>{html.escape(ram_free)}</b> · "
+            f"🔄 AutoResume: <b>{html.escape(auto_resume)}</b>\n"
             f"♻️ Last Sync: <code>{html.escape(last_sync)}</code>\n"
             f"{SEP}\n"
             f"<code>ID  STATUS    ACCOUNT      TH    CON</code>"
@@ -115,25 +153,19 @@ class UIManager:
                 thr_val = int(thr_raw)
             except (ValueError, TypeError):
                 thr_val = 0
-            emoji = _hub_emoji(state, healthy)
-            # Status label short
-            if state == "RUNNING" and healthy:
-                st_label = "ACTIVE"
-            elif state == "RUNNING":
-                st_label = "STUCK"
-            elif state == "STARTING":
-                st_label = "START…"
-            else:
-                st_label = "IDLE"
-            cpu_display = f"{cpu_raw}%" if cpu_raw != "—" else "0%"
             # cpu_raw field stores TCP connection count (written via ":cpu" state key)
             try:
                 con_val = int(cpu_raw) if cpu_raw not in ("—", "") else 0
             except (ValueError, TypeError):
                 con_val = 0
+
+            emoji = _hub_emoji(state, healthy)
+            # V11.0 Net-Pulse: TCP-based status label (CON > TH)
             tcp_lbl = _tcp_status_label(con_val, state)
+            con_disp = _con_display(con_val, state)
+
             lines.append(
-                f"<code>[{letter}] {emoji} {tcp_lbl:<6}  {nick_esc:<12}  {thr_val:<5}  {con_val}</code>"
+                f"<code>[{letter}] {emoji} {tcp_lbl:<6}  {nick_esc:<12}  {thr_val:<5}</code>  {con_disp}"
             )
 
         lines.append(SEP)
@@ -161,7 +193,6 @@ class UIManager:
                 thr_val = int(thr_raw)
             except (ValueError, TypeError):
                 thr_val = 0
-            # Format: [B] 🟢 Nick | 145th | 12con
             try:
                 con_val_btn = int(cpu_raw) if cpu_raw not in ("—", "") else 0
             except (ValueError, TypeError):

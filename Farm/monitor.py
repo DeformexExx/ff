@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-# Aegis MonitorEngine — V10.1 Ghost Killer
+# Aegis MonitorEngine — V11.0 Net-Pulse
+# TCP connections are the PRIMARY health indicator (CON > TH).
+# Thresholds: CON >= 8 → ACTIVE,  CON <= 5 → ZOMBIE,  CON == 0 → IDLE only if process dead.
+# If CON > 0, status is NEVER "IDLE" — even if TH reports 0.
 import os
 import re
 import logging
@@ -41,11 +44,15 @@ async def clone_pgrep_alive(suffix: str) -> bool:
 
 
 class MonitorEngine:
-    """Triple-check monitoring engine for Aegis Roblox farm."""
+    """Net-Pulse monitoring engine for Aegis Roblox farm V11.0."""
 
     # ── static alias so both `clone_pgrep_alive(sfx)` and
     #    `MonitorEngine.clone_pgrep_alive(sfx)` work everywhere ──────────────
     clone_pgrep_alive = staticmethod(clone_pgrep_alive)
+
+    # V11.0 calibrated thresholds (Net-Pulse: TCP is king)
+    TCP_ACTIVE = 8    # ≥8 → ACTIVE (normal game session)
+    TCP_ZOMBIE = 5    # ≤5 → ZOMBIE (frozen/crashed — triggers restart)
 
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
@@ -135,32 +142,73 @@ class MonitorEngine:
     @staticmethod
     async def get_threads(pid: str) -> int:
         """
-        Thread count — single su call reads status + task dir in one shot.
+        V11.0 Deep thread count — Net-Pulse enhanced.
+        Primary: su -c "ls /proc/{pid}/task | wc -l"  (most reliable on Android)
+        Fallback: grep Threads /proc/{pid}/status
         Returns 0 on any failure.
         """
         if not pid or not str(pid).isdigit():
             return 0
-        # Grouped: try Threads from /proc/status; pipe to grep
+        # PRIMARY: ls /proc/{pid}/task — counts actual kernel threads
         _, stdout, _ = await run_bash(
-            f"su -c \"grep Threads /proc/{pid}/status 2>/dev/null || ls /proc/{pid}/task 2>/dev/null | wc -l\""
+            f"su -c \"ls /proc/{pid}/task 2>/dev/null | wc -l\""
         )
         raw = stdout.strip()
-        if not raw:
-            return 0
-        # If result is "Threads:\t142" style
-        m = re.search(r"Threads:\s*(\d+)", raw)
-        if m:
+        if raw:
             try:
-                return int(m.group(1))
+                val = int(raw)
+                if val > 0:
+                    return val
             except ValueError:
                 pass
-        # Otherwise it's the wc -l count
-        lines = raw.splitlines()
-        last = lines[-1].strip()
-        try:
-            return int(last)
-        except ValueError:
-            return 0
+        # FALLBACK: Threads field from /proc/status
+        _, stdout2, _ = await run_bash(
+            f"su -c \"grep Threads /proc/{pid}/status 2>/dev/null\""
+        )
+        raw2 = stdout2.strip()
+        if raw2:
+            m = re.search(r"Threads:\s*(\d+)", raw2)
+            if m:
+                try:
+                    return int(m.group(1))
+                except ValueError:
+                    pass
+        return 0
+
+    # ─────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    async def get_threads_deep(suffix: str) -> int:
+        """
+        V11.0 Net-Pulse deep thread count using suffix directly.
+        Uses: su -c "ls /proc/$(pgrep -f com.roblox.clien{suffix})/task | wc -l"
+        Fallback: ps -At | grep clien{suffix} | wc -l
+        """
+        pkg = f"com.roblox.clien{suffix}"
+        # Primary: deep method via pgrep+task
+        _, out1, _ = await run_bash(
+            f"su -c \"ls /proc/$(pgrep -f {pkg} | head -n1)/task 2>/dev/null | wc -l\""
+        )
+        raw1 = out1.strip()
+        if raw1:
+            try:
+                val = int(raw1)
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+        # Fallback: ps -At thread listing
+        _, out2, _ = await run_bash(
+            f"su -c \"ps -At 2>/dev/null | grep clien{suffix} | wc -l\""
+        )
+        raw2 = out2.strip()
+        if raw2:
+            try:
+                val2 = int(raw2)
+                if val2 > 0:
+                    return val2
+            except ValueError:
+                pass
+        return 0
 
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
@@ -241,36 +289,16 @@ class MonitorEngine:
     async def get_clone_stats(suffix: str) -> Tuple[bool, int, float]:
         """
         Single-call triple-check: returns (is_alive, threads, cpu_percent).
-        Uses the manifest command:
-          su -c "cat /proc/$(pgrep -f com.roblox.clien{suffix} | head -n 1)/status | grep Threads"
+        V11.0: Uses deep thread count method.
         cpu_percent is -1.0 when not measurable.
         """
-        pkg = f"com.roblox.clien{suffix}"
-
         # ── liveness ──────────────────────────────────────────────────────────
         is_alive = await clone_pgrep_alive(suffix)
         if not is_alive:
             return False, 0, -1.0
 
-        # ── threads via /proc/status Threads field ────────────────────────────
-        threads = 0
-        _, thr_out, _ = await run_bash(
-            f"su -c \"cat /proc/$(pgrep -f {pkg} | head -n 1)/status | grep Threads\""
-        )
-        thr_raw = thr_out.strip()
-        if thr_raw:
-            m = re.search(r"Threads:\s*(\d+)", thr_raw)
-            if m:
-                try:
-                    threads = int(m.group(1))
-                except ValueError:
-                    pass
-
-        if not threads:
-            # fallback: get PID then task dir
-            pid = await MonitorEngine.get_pid(suffix)
-            if pid:
-                threads = await MonitorEngine.get_threads(pid)
+        # ── threads via deep method ───────────────────────────────────────────
+        threads = await MonitorEngine.get_threads_deep(suffix)
 
         # ── CPU ───────────────────────────────────────────────────────────────
         cpu = await MonitorEngine.get_clone_cpu_percent(suffix)
@@ -308,23 +336,24 @@ class MonitorEngine:
         except ValueError:
             return 0
 
-    # Real-world thresholds (observed: healthy clone holds 60-64 TCP connections)
-    TCP_ACTIVE  = 45   # ≥45 → fully active in-game
-    TCP_STUCK   = 40   # <40 → zombie/stuck → restart
-
+    # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
     def classify_connections(conns: int) -> str:
         """
-        Return TCP status label based on calibrated real-world thresholds.
-        0        → IDLE    (not running)
-        1-44     → LOADING (joining / warming up)
-        ≥45      → ACTIVE  (fully in-game, 60-64 typical)
-        <40 live → STUCK   (zombie — triggers restart)
+        V11.0 Net-Pulse TCP classification (TCP > TH):
+        ≥8       → ACTIVE  (healthy in-game session)
+        6-7      → LOADING (connecting to server)
+        1-5      → ZOMBIE  (frozen/crashed, triggers restart)
+        0        → IDLE    (not running) — BUT only if process is dead!
+        
+        RULE: If conns > 0, status is NEVER "IDLE".
         """
         if conns >= MonitorEngine.TCP_ACTIVE:
             return "ACTIVE"
-        if conns > 0:
+        if conns > MonitorEngine.TCP_ZOMBIE:
             return "LOADING"
+        if conns > 0:
+            return "ZOMBIE"
         return "IDLE"
 
     # ─────────────────────────────────────────────────────────────────────────
