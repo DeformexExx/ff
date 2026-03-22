@@ -897,8 +897,8 @@ class AegisBot:
         - RAM-Check: if free < 550MB, delay 20s extra
         - Saves enabled state for each clone
         """
-        STAGGER_SEC = 15
-        RAM_MIN_MB  = 550
+        STAGGER_SEC = 5
+        RAM_MIN_MB  = 150
         self.is_mass_starting = True
         clones = [c for c in self.config.clones_data if c.get("active", True)]
 
