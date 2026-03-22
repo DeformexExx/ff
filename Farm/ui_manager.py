@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# ui_manager.py — Aegis V11.0 (Net-Pulse UI)
+# ui_manager.py — Aegis V12.0 (Net-Pulse UI — Stable Architecture)
 # CON column: >15 → Green, 8-14 → White, ≤5 → Blinking Red 🔴
 # AutoResume: ENABLED indicator in header
 import html

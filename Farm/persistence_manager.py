@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# persistence_manager.py — Aegis V11.0 (Persistent State / AutoResume)
+# persistence_manager.py — Aegis V12.0 (Persistent State / AutoResume)
 # Creates and manages session_state.json for crash-proof state recovery.
 # State is written IMMEDIATELY on every Start/Stop action so even SIGKILL
 # cannot lose the intended state.

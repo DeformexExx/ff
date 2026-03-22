@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
-# Aegis MonitorEngine — V11.0 Net-Pulse
+# Aegis MonitorEngine — V12.0 Net-Pulse (Stable Architecture)
 # TCP connections are the PRIMARY health indicator (CON > TH).
 # Thresholds: CON >= 8 → ACTIVE,  CON <= 5 → ZOMBIE,  CON == 0 → IDLE only if process dead.
 # If CON > 0, status is NEVER "IDLE" — even if TH reports 0.
+# V12.0: Connection result caching (15s TTL), PID caching via /proc check.
 import os
 import re
+import time
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 from bash_utils import run_bash
 
 logger = logging.getLogger("MonitorEngine")
+
+# V12.0: Connection cache — {suffix: (timestamp, conn_count)}
+# Prevents hammering netstat every few seconds; 15s TTL
+_conn_cache: Dict[str, Tuple[float, int]] = {}
+_CONN_CACHE_TTL = 15.0  # seconds
 
 
 async def clone_pgrep_alive(suffix: str) -> bool:
@@ -44,7 +51,7 @@ async def clone_pgrep_alive(suffix: str) -> bool:
 
 
 class MonitorEngine:
-    """Net-Pulse monitoring engine for Aegis Roblox farm V11.0."""
+    """Net-Pulse monitoring engine for Aegis Roblox farm V12.0."""
 
     # ── static alias so both `clone_pgrep_alive(sfx)` and
     #    `MonitorEngine.clone_pgrep_alive(sfx)` work everywhere ──────────────
@@ -309,12 +316,21 @@ class MonitorEngine:
     @staticmethod
     async def get_clone_connections(suffix: str) -> int:
         """
-        Count active TCP connections for com.roblox.clien{suffix}.
+        V12.0: Count active TCP connections with 15s cache.
+        Prevents hammering netstat — reduces CPU/IO load and Bad file descriptor errors.
         Uses: su -c "netstat -ntp | grep com.roblox.clien{suffix} | wc -l"
         Falls back to ss if netstat is unavailable.
-        Returns 0 on any error.
+        Returns cached value if within 15s TTL.
         """
+        now = time.time()
+        cached = _conn_cache.get(suffix)
+        if cached:
+            ts, val = cached
+            if now - ts < _CONN_CACHE_TTL:
+                return val
+
         pkg = f"com.roblox.clien{suffix}"
+        result = 0
         # Primary: netstat
         _, out, _ = await run_bash(
             f"su -c \"netstat -ntp 2>/dev/null | grep {pkg} | wc -l\""
@@ -323,7 +339,9 @@ class MonitorEngine:
         try:
             n = int(raw)
             if n >= 0:
-                return n
+                result = n
+                _conn_cache[suffix] = (now, result)
+                return result
         except ValueError:
             pass
         # Fallback: ss (socket statistics)
@@ -332,15 +350,17 @@ class MonitorEngine:
         )
         raw2 = out2.strip()
         try:
-            return int(raw2)
+            result = int(raw2)
         except ValueError:
-            return 0
+            result = 0
+        _conn_cache[suffix] = (now, result)
+        return result
 
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
     def classify_connections(conns: int) -> str:
         """
-        V11.0 Net-Pulse TCP classification (TCP > TH):
+        V12.0 Net-Pulse TCP classification (TCP > TH):
         ≥8       → ACTIVE  (healthy in-game session)
         6-7      → LOADING (connecting to server)
         1-5      → ZOMBIE  (frozen/crashed, triggers restart)

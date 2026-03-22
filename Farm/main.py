@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Aegis bot — V11.0 PHOENIX & NET-PULSE
+# Aegis bot — V12.0 STABLE ARCHITECTURE
 import os
 import sys
 import enum
@@ -18,9 +18,17 @@ sys.path.insert(0, _bot_dir)
 
 # ── IMMORTALITY: apply before anything else ──────────────────────────────────
 def apply_immortality() -> None:
-    """Anti-OOM: oom_score_adj=-1000, nice=-20, termux-wake-lock."""
+    """Anti-OOM: oom_adj=-17, oom_score_adj=-1000, nice=-20, termux-wake-lock."""
     pid = os.getpid()
-    # oom_score_adj: kernel will never OOM-kill this process
+    # V12.0 OOM Shield: oom_adj=-17 (legacy) + oom_score_adj=-1000
+    # Android kills processes with highest oom_adj first; -17 = last to die
+    try:
+        subprocess.run(
+            ["su", "-c", f"echo -17 > /proc/{pid}/oom_adj"],
+            capture_output=True, timeout=15,
+        )
+    except Exception:
+        pass
     try:
         subprocess.run(
             ["su", "-c", f"echo -1000 > /proc/{pid}/oom_score_adj"],
@@ -67,7 +75,7 @@ from injection_engine    import InjectionEngine
 from bash_utils          import run_bash
 from persistence_manager import PersistenceManager
 
-VERSION = "11.0"
+VERSION = "12.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,7 +85,7 @@ logging.basicConfig(
         logging.FileHandler(BOOT_LOG, encoding="utf-8"),
     ]
 )
-logger = logging.getLogger("AegisV11")
+logger = logging.getLogger("AegisV12")
 for _quiet in ("httpx", "httpcore", "telegram", "telegram.ext", "telegram.request"):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
@@ -103,9 +111,9 @@ async def watchdog_hard_reset(
     reason: str,
 ) -> None:
     """
-    V11.0 Hard Reset Protocol:
+    V12.0 Hard Reset Protocol:
     1. su -c "am force-stop com.roblox.clien{suffix}"
-    2. su -c "rm -rf /data/data/com.roblox.clien{suffix}/cache/*"
+    2. su -c "rm -rf /data/data/com.roblox.clien{suffix}/cache/* code_cache/*"
     3. Pause 3 seconds
     4. Relaunch clone
     NO drop_caches — filesystem is read-only.
@@ -126,8 +134,8 @@ async def watchdog_hard_reset(
 
     # Step 1: force-stop
     await run_bash(f"su -c 'am force-stop {pkg}'")
-    # Step 2: clear app cache only (Safe Clean)
-    await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/*'")
+    # Step 2: deep cache clean (cache + code_cache)
+    await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/* /data/data/{pkg}/code_cache/*'")
     # Step 3: pause
     await asyncio.sleep(3)
     bot_instance.set_state(name, CloneState.STOPPED)
@@ -137,23 +145,23 @@ async def watchdog_hard_reset(
 
 async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
     """
-    V11.0 Intelligent Watchdog — Net-Pulse powered.
-    Runs every 30s. Only acts on clones with enabled=True in session_state.
+    V12.0 Intelligent Watchdog — Net-Pulse powered.
+    Runs every 15s. Only acts on clones with enabled=True in session_state.
 
-    Stage 1 — Liveness:   pgrep returns no PID → Hard Reset
-    Stage 2 — TCP Guard:  CON ≤ 5 (ZOMBIE) sustained for 45s → Hard Reset
+    Stage 1 — Liveness:   cached PID check via /proc/{pid} → Hard Reset if gone
+    Stage 2 — TCP Guard:  CON ≤ 5 (ZOMBIE) sustained for 30s → Hard Reset
               CON ≥ 8  (ACTIVE) → healthy, reset zombie timer
     Stage 3 — Threads:    Deep thread check (ls /proc/PID/task).
               If TH==0 but CON>0 → ignore TH (Net-Pulse rule).
               If TH==0 and CON==0 → phantom kill.
-    RAM Guard: free RAM < 1.5 GB → sync (no drop_caches)
+    RAM Guard: free RAM < 1.0 GB → sync (no drop_caches)
     """
     GRACE_SEC    = 120    # startup grace before checking
     TCP_ACTIVE   = 8      # ≥8 → ACTIVE
     TCP_ZOMBIE   = 5      # ≤5 → ZOMBIE
-    ZOMBIE_SEC   = 45     # V11.0: 45s sustained ZOMBIE → Hard Reset
-    POLL_SEC     = 30     # check every 30s for faster response
-    RAM_LOW_GB   = 1.5
+    ZOMBIE_SEC   = 30     # V12.0: 30s sustained ZOMBIE → Hard Reset
+    POLL_SEC     = 15     # V12.0: poll every 15s
+    RAM_LOW_GB   = 1.0    # V12.0: lower threshold for 15GB devices
 
     # Per-clone zombie timer: {name: timestamp when conns first dropped to ZOMBIE}
     tcp_low_since: Dict[str, float] = {}
@@ -176,8 +184,17 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                 suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
                 uptime = now - bot_instance.running_since.get(name, now)
 
-                # ── Stage 1: Liveness ─────────────────────────────────────────
-                alive = await clone_pgrep_alive(suffix)
+                # ── Stage 1: Liveness (PID cache fast-path) ───────────────────
+                cached_pid = bot_instance.pid_cache.get(name)
+                if cached_pid and os.path.exists(f"/proc/{cached_pid}"):
+                    alive = True
+                else:
+                    alive = await clone_pgrep_alive(suffix)
+                    if alive:
+                        # Update PID cache
+                        new_pid = await MonitorEngine.get_pid(suffix)
+                        if new_pid:
+                            bot_instance.pid_cache[name] = new_pid
                 if not alive:
                     tcp_low_since.pop(name, None)
                     logger.warning(f"Watchdog [{name}]: Stage1 — no process → Hard Reset")
@@ -265,6 +282,8 @@ class AegisBot:
         self.is_mass_starting = False
         self.watchdog_cpu_low_since: Dict[str, Optional[float]] = {}
         self._last_sync_ts: float = 0.0  # timestamp of last hub refresh
+        # V12.0: PID cache — {clone_name: pid_str}, updated on start, checked via /proc
+        self.pid_cache: Dict[str, str] = {}
 
         for c in self.config.clones_data:
             n = c.get("name")
@@ -779,6 +798,10 @@ class AegisBot:
             if ok:
                 self.set_state(name, CloneState.RUNNING)
                 self.persistence.add_target(name, "RUNNING")
+                # V12.0: Cache PID for fast liveness checks
+                cached_pid = await MonitorEngine.get_pid(suffix)
+                if cached_pid:
+                    self.pid_cache[name] = cached_pid
             else:
                 self.set_state(name, CloneState.STOPPED)
 
@@ -826,15 +849,56 @@ class AegisBot:
         """Global deep clean: sync only (no drop_caches — read-only on some ROMs)."""
         await run_bash("su -c 'sync'")
 
+    @staticmethod
+    async def _get_free_ram_mb() -> float:
+        """Read free RAM in MB from /proc/meminfo or free -m. Returns 9999 on error."""
+        try:
+            with open("/proc/meminfo", "r") as f:
+                content = f.read()
+            m = re.search(r"MemAvailable:\s+(\d+)\s+kB", content)
+            if not m:
+                m = re.search(r"MemFree:\s+(\d+)\s+kB", content)
+            if m:
+                return int(m.group(1)) / 1024.0
+        except Exception:
+            pass
+        # Fallback: free -m
+        try:
+            _, out, _ = await run_bash("free -m | grep Mem")
+            parts = out.split()
+            if len(parts) >= 4:
+                return float(parts[3])  # available column
+        except Exception:
+            pass
+        return 9999.0  # assume OK if can't read
+
+    async def _wait_for_ram(self, min_free_mb: float = 550, max_wait: int = 60) -> bool:
+        """
+        V12.0 RAM-Check: wait until free RAM >= min_free_mb.
+        Retries every 20s up to max_wait seconds total.
+        Returns True if RAM is OK, False if timed out.
+        """
+        waited = 0
+        while waited < max_wait:
+            free_mb = await self._get_free_ram_mb()
+            if free_mb >= min_free_mb:
+                return True
+            logger.warning(f"RAM-Check: {free_mb:.0f}MB free < {min_free_mb}MB — waiting 20s…")
+            await asyncio.sleep(20)
+            waited += 20
+        return False
+
     async def _mass_start(self, chat_id):
         """
-        V11.0 Staggered Start (Anti-Freeze):
+        V12.0 Intelligent Queue (Anti-Freeze Start):
         - NO nuclear clean (would kill Python process)
         - Per-clone Safe Clean before each launch
-        - 15s interval between launches (queue-based)
+        - 15s interval between launches
+        - RAM-Check: if free < 550MB, delay 20s extra
         - Saves enabled state for each clone
         """
         STAGGER_SEC = 15
+        RAM_MIN_MB  = 550
         self.is_mass_starting = True
         clones = [c for c in self.config.clones_data if c.get("active", True)]
 
@@ -844,7 +908,7 @@ class AegisBot:
         try:
             m = await app.bot.send_message(
                 chat_id,
-                f"🚀 Staggered Start V11.0 — {len(clones)} клонов (пауза {STAGGER_SEC}с)…",
+                f"🚀 Staggered Start V12.0 — {len(clones)} клонов (пауза {STAGGER_SEC}с + RAM check)…",
                 parse_mode="HTML",
             )
 
@@ -860,7 +924,13 @@ class AegisBot:
                 name = c.get("name")
                 if not name:
                     continue
-                # V11.0: Mark enabled in session_state BEFORE launch
+
+                # V12.0 RAM-Check before each clone launch
+                ram_ok = await self._wait_for_ram(RAM_MIN_MB, max_wait=60)
+                if not ram_ok:
+                    logger.warning(f"Mass Start [{name}]: RAM still low after 60s, launching anyway")
+
+                # Mark enabled in session_state BEFORE launch
                 self.persistence.set_clone_enabled(name, True)
                 await app.bot.send_message(
                     chat_id,
@@ -1091,9 +1161,9 @@ class AegisBot:
 
     async def _auto_recover(self) -> None:
         """
-        V11.0 Persistent AutoResume — reads session_state.json (not DEV file).
+        V12.0 Persistent AutoResume — reads session_state.json (not DEV file).
         Restores all clones that had enabled=True before crash/reboot.
-        Uses staggered start (15s between launches) to avoid RAM overload.
+        Uses Intelligent Queue (15s stagger + RAM-Check) to avoid OOM.
         Runs once, 10s after startup.
         """
         await asyncio.sleep(10)
@@ -1120,13 +1190,19 @@ class AegisBot:
             except Exception:
                 pass
 
-        STAGGER_SEC = 15  # same as mass_start interval
+        STAGGER_SEC = 15
+        RAM_MIN_MB  = 550
 
         for idx, name in enumerate(enabled_clones, 1):
             # Verify clone exists in config
             if not self.config.get_clone(name):
                 logger.warning(f"AutoResume: [{name}] not in config, skipping.")
                 continue
+
+            # V12.0: RAM-Check before each resume
+            ram_ok = await self._wait_for_ram(RAM_MIN_MB, max_wait=60)
+            if not ram_ok:
+                logger.warning(f"AutoResume [{name}]: RAM still low after 60s, launching anyway")
 
             suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
             alive = await clone_pgrep_alive(suffix)
@@ -1139,8 +1215,9 @@ class AegisBot:
                     continue
                 else:
                     logger.warning(f"AutoResume [{name}]: alive but CON={conns} → Hard Reset")
-                    await run_bash(f"su -c 'am force-stop com.roblox.clien{suffix}'")
-                    await run_bash(f"su -c 'rm -rf /data/data/com.roblox.clien{suffix}/cache/*'")
+                    pkg = f"com.roblox.clien{suffix}"
+                    await run_bash(f"su -c 'am force-stop {pkg}'")
+                    await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/* /data/data/{pkg}/code_cache/*'")
                     await asyncio.sleep(3)
 
             logger.info(f"AutoResume [{idx}/{len(enabled_clones)}]: launching {name}")
