@@ -812,15 +812,15 @@ class AegisBot:
 
     async def _soft_clean(self, suffix: str) -> None:
         """
-        Soft clean for a single clone:
+        Safe Clean for a single clone before launch:
         - am force-stop (kill phantom process)
-        - rm cache (free stored data)
-        NOTE: No drop_caches — /proc/sys/vm is read-only on some Android ROMs.
+        - rm cache + code_cache (free stored data, optimize RAM)
+        NOTE: No drop_caches — /proc/sys/vm is read-only.
         """
         pkg = f"com.roblox.clien{suffix}"
-        await run_bash(
-            f"su -c 'am force-stop {pkg}; rm -rf /data/data/{pkg}/cache/*'"
-        )
+        await run_bash(f"su -c 'am force-stop {pkg}'")
+        await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/*'")
+        await run_bash(f"su -c 'rm -rf /data/data/{pkg}/code_cache/*'")
 
     async def _do_deep_clean(self) -> None:
         """Global deep clean: sync only (no drop_caches — read-only on some ROMs)."""
@@ -877,8 +877,9 @@ class AegisBot:
 
     async def _mass_stop(self, chat_id):
         """
-        V11.0 Mass stop — grouped force-stop all (no pkill — safe for Python).
-        Marks all clones as disabled in session_state.
+        V11.0 Mass stop — per-clone am force-stop + cache clean.
+        Loops through each active clone with 1s pause between them.
+        No pkill, no grouped commands — surgical per-clone stop.
         """
         self.is_mass_starting = False
         app = self.application
@@ -887,42 +888,50 @@ class AegisBot:
         try:
             m = await app.bot.send_message(chat_id, "🛑 Остановка…", parse_mode="HTML")
 
-            # Reset all bot states + session_state immediately
             for c in self.config.clones_data:
                 n = c.get("name")
-                if n:
-                    self.set_state(n, CloneState.STOPPED)
-                    self.persistence.remove_target(n)
-                    # V11.0: also mark disabled in session_state
-                    self.persistence.set_clone_enabled(n, False)
+                if not n:
+                    continue
+                suffix = n[-1].lower() if n.lower().startswith("clien") else n.lower()
+                pkg = f"com.roblox.clien{suffix}"
 
-            # Build one grouped su -c command for all force-stops (no pkill)
-            stops = "; ".join(
-                f"am force-stop com.roblox.clien{c.get('name', '')[-1].lower()}"
-                for c in self.config.clones_data if c.get("name")
-            )
-            await run_bash(f"su -c '{stops}'")
+                # Reset bot state + session_state
+                self.set_state(n, CloneState.STOPPED)
+                self.persistence.remove_target(n)
+                self.persistence.set_clone_enabled(n, False)
 
-            await m.edit_text("🛑 Готово.", parse_mode="HTML")
+                # Surgical force-stop + cache clean for this clone
+                await run_bash(f"su -c 'am force-stop {pkg}'")
+                await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/*'")
+                await run_bash(f"su -c 'rm -rf /data/data/{pkg}/code_cache/*'")
+                await asyncio.sleep(1)  # 1s pause between clones
+
+            await m.edit_text("🛑 Готово. Кэш всех клонов очищен.", parse_mode="HTML")
         except Exception as e:
             logger.error(f"Mass Stop Error: {e}")
 
         await self.refresh_dashboard(force=True)
 
     async def _stop_clone(self, name: Optional[str], chat_id):
-        """Stop a single clone — ONLY am force-stop, never pkill (would kill neighbours)."""
+        """Stop a single clone — am force-stop + cache clean. Never pkill."""
         if not name: return
         self.set_state(name, CloneState.STOPPED)
         self.persistence.remove_target(name)
         suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
-        # Official Android method — isolates only this package
-        await run_bash(f"su -c 'am force-stop com.roblox.clien{suffix}'")
-        await asyncio.sleep(5)  # let system free RAM before next action
+        pkg = f"com.roblox.clien{suffix}"
+        # Surgical: force-stop + cache clean for this clone only
+        await run_bash(f"su -c 'am force-stop {pkg}'")
+        await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/*'")
+        await run_bash(f"su -c 'rm -rf /data/data/{pkg}/code_cache/*'")
+        await asyncio.sleep(2)  # let system free RAM
         app = self.application
         if chat_id and app:
             try:
                 await app.bot.send_message(
-                    chat_id, f"🛑 <code>{html.escape(name.replace('_', '-'))}</code>", parse_mode="HTML")
+                    chat_id,
+                    f"🛑 <code>{html.escape(name.replace('_', '-'))}</code> · кэш очищен",
+                    parse_mode="HTML",
+                )
             except Exception:
                 pass
         await self.refresh_dashboard(force=True)
