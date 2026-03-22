@@ -81,7 +81,7 @@ class UIManager:
             f"💎 <b>AEGIS OS V{_version}</b> | 🧠 RAM: <b>{html.escape(ram_free)}</b>\n"
             f"♻️ Last Sync: <code>{html.escape(last_sync)}</code>\n"
             f"{SEP}\n"
-            f"<code>ID  STATUS    ACCOUNT      TH    CPU</code>"
+            f"<code>ID  STATUS    ACCOUNT      TH    CON</code>"
         )
 
         lines = [header]
@@ -112,8 +112,13 @@ class UIManager:
             else:
                 st_label = "IDLE"
             cpu_display = f"{cpu_raw}%" if cpu_raw != "—" else "0%"
+            # cpu_raw field now stores TCP connection count (watchdog writes it via ":cpu" key)
+            try:
+                con_val = int(cpu_raw) if cpu_raw not in ("—", "") else 0
+            except (ValueError, TypeError):
+                con_val = 0
             lines.append(
-                f"<code>[{letter}] {emoji} {st_label:<6}  {nick_esc:<12}  {thr_val:<5}  {cpu_display}</code>"
+                f"<code>[{letter}] {emoji} {st_label:<6}  {nick_esc:<12}  {thr_val:<5}  {con_val}</code>"
             )
 
         lines.append(SEP)
@@ -141,8 +146,12 @@ class UIManager:
                 thr_val = int(thr_raw)
             except (ValueError, TypeError):
                 thr_val = 0
-            # Format: [B] 🟢 Nick | 145th | 20% CPU
-            label = f"[{letter}] {emoji} {nick_short} | {thr_val}th | {cpu_raw}%"
+            # Format: [B] 🟢 Nick | 145th | 12con
+            try:
+                con_val_btn = int(cpu_raw) if cpu_raw not in ("—", "") else 0
+            except (ValueError, TypeError):
+                con_val_btn = 0
+            label = f"[{letter}] {emoji} {nick_short} | {thr_val}th | {con_val_btn}con"
             chunk.append(
                 InlineKeyboardButton(label, callback_data=f"clone_{raw_name}")
             )

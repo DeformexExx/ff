@@ -168,26 +168,45 @@ class MonitorEngine:
         """
         CPU % for com.roblox.clien{suffix}.
 
-        Strategy (V10.1):
-          1. PRIMARY: /proc/{pid}/stat utime+stime delta over 0.8s sample.
-          2. FALLBACK: top -n 1 | grep {pkg} — only if stat delta yields 0.
-          3. If both give 0 or empty — return the last known value (don't drop to 0 in UI).
+        Strategy (V10.2):
+          1. PRIMARY: top -b -n 2 -p {PID} | tail -1  (2-pass average, most accurate)
+             Android top may not support -b; if output is empty, falls through.
+          2. SECONDARY: /proc/{pid}/stat utime+stime delta over 0.8s.
+          3. STICKY: if both yield 0 — return last cached value (no UI flicker).
 
-        Returns -1.0 only when process is genuinely not found.
-        _prev_cache: module-level dict keyed by suffix, stores last good value.
+        Returns -1.0 only when process is dead/not found.
         """
         import time as _time
         import asyncio as _asyncio
         pkg = f"com.roblox.clien{suffix}"
 
-        # ── Step 1: get PID via single su call ───────────────────────────────
+        # ── Step 1: get PID ───────────────────────────────────────────────────
         _, pg_out, _ = await run_bash(f"su -c 'pgrep -f {pkg} | head -n 1'")
         pid = pg_out.strip().splitlines()[0].strip() if pg_out.strip() else ""
         if not pid or not pid.isdigit():
             _prev_cache.pop(suffix, None)
             return -1.0
 
-        # ── Step 2: /proc/stat delta (primary) ───────────────────────────────
+        # ── Step 2 (PRIMARY): top -b -n 2 -p {PID} | tail -1 ─────────────────
+        _, top2_out, _ = await run_bash(
+            f"su -c \"top -b -n 2 -p {pid} 2>/dev/null | tail -1\""
+        )
+        top2_line = top2_out.strip()
+        if top2_line:
+            m = re.search(r"(\d+(?:\.\d+)?)\s*%", top2_line)
+            if not m:
+                # Some Android top omits %; grab first number in line
+                m = re.search(r"\s(\d+(?:\.\d+)?)\s", top2_line)
+            if m:
+                try:
+                    top_cpu = float(m.group(1))
+                    if top_cpu > 0:
+                        _prev_cache[suffix] = top_cpu
+                        return top_cpu
+                except ValueError:
+                    pass
+
+        # ── Step 3 (SECONDARY): /proc/stat delta ──────────────────────────────
         def _read_ticks(p: str) -> Optional[int]:
             try:
                 with open(f"/proc/{p}/stat", "r") as f:
@@ -198,46 +217,24 @@ class MonitorEngine:
 
         t0 = _time.monotonic()
         ticks0 = _read_ticks(pid)
-        if ticks0 is None:
-            _prev_cache.pop(suffix, None)
-            return -1.0
+        if ticks0 is not None:
+            await _asyncio.sleep(0.8)
+            t1 = _time.monotonic()
+            ticks1 = _read_ticks(pid)
+            if ticks1 is not None:
+                hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+                elapsed = t1 - t0
+                stat_cpu = round(max(((ticks1 - ticks0) / hz) / elapsed * 100.0, 0.0), 1)
+                if stat_cpu > 0:
+                    _prev_cache[suffix] = stat_cpu
+                    return stat_cpu
 
-        await _asyncio.sleep(0.8)
-
-        t1 = _time.monotonic()
-        ticks1 = _read_ticks(pid)
-        if ticks1 is None:
-            _prev_cache.pop(suffix, None)
-            return -1.0
-
-        hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-        elapsed = t1 - t0
-        cpu = round(max(((ticks1 - ticks0) / hz) / elapsed * 100.0, 0.0), 1)
-
-        if cpu > 0:
-            _prev_cache[suffix] = cpu
-            return cpu
-
-        # ── Step 3: top fallback if stat delta = 0 ───────────────────────────
-        _, top_out, _ = await run_bash(f"su -c \"top -n 1 | grep {pkg}\"")
-        line = top_out.strip().splitlines()[0] if top_out.strip() else ""
-        if line:
-            m = re.search(r"(\d+(?:\.\d+)?)%", line)
-            if m:
-                try:
-                    top_cpu = float(m.group(1))
-                    if top_cpu > 0:
-                        _prev_cache[suffix] = top_cpu
-                        return top_cpu
-                except ValueError:
-                    pass
-
-        # ── Step 4: keep last known value — don't flash 0% in UI ─────────────
+        # ── Step 4 (STICKY): keep last known — don't flash 0% in UI ──────────
         last = _prev_cache.get(suffix)
         if last is not None:
-            return last  # stale but better than 0
+            return last
 
-        return 0.0  # truly unknown, process may be idle
+        return 0.0
 
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
@@ -279,6 +276,51 @@ class MonitorEngine:
         cpu = await MonitorEngine.get_clone_cpu_percent(suffix)
 
         return True, threads, cpu
+
+    # ─────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    async def get_clone_connections(suffix: str) -> int:
+        """
+        Count active TCP connections for com.roblox.clien{suffix}.
+        Uses: su -c "netstat -ntp | grep com.roblox.clien{suffix} | wc -l"
+        Falls back to ss if netstat is unavailable.
+        Returns 0 on any error.
+        """
+        pkg = f"com.roblox.clien{suffix}"
+        # Primary: netstat
+        _, out, _ = await run_bash(
+            f"su -c \"netstat -ntp 2>/dev/null | grep {pkg} | wc -l\""
+        )
+        raw = out.strip()
+        try:
+            n = int(raw)
+            if n >= 0:
+                return n
+        except ValueError:
+            pass
+        # Fallback: ss (socket statistics)
+        _, out2, _ = await run_bash(
+            f"su -c \"ss -ntp 2>/dev/null | grep {pkg} | wc -l\""
+        )
+        raw2 = out2.strip()
+        try:
+            return int(raw2)
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def classify_connections(conns: int) -> str:
+        """
+        Return TCP status label based on connection count.
+        0-2  → ZOMBIE  (crashed / frozen)
+        3-9  → LOADING (joining server)
+        10+  → RUNNING (fully active in-game)
+        """
+        if conns >= 10:
+            return "RUNNING"
+        if conns >= 3:
+            return "LOADING"
+        return "ZOMBIE"
 
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod

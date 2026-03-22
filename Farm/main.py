@@ -126,29 +126,20 @@ async def watchdog_safe_restart(
 async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
     """
     Three-stage guardian — runs every 60 s per clone:
-    Stage 1 — Liveness:  pgrep returns no PID → RESTART
-    Stage 2 — Threads:   threads < 145 after grace → RESTART (phantom if threads==0 but alive)
-    Stage 3 — Freeze:    utime+stime from /proc/stat unchanged for 120s → RESTART
+    Stage 1 — Liveness:   pgrep returns no PID → RESTART
+    Stage 2 — Threads:    threads < 145 after grace → RESTART; threads==0 → phantom kill
+    Stage 3 — TCP Guard:  netstat connections < 3 for 120s → RESTART (zombie/frozen)
+    RAM Guard: free RAM < 2 GB → drop_caches once per cycle
     """
     GRACE_SEC    = 120
     MIN_THREADS  = 145
-    FREEZE_SEC   = 120
+    TCP_LOW_SEC  = 120   # seconds of <3 connections before restart
+    TCP_MIN      = 3     # minimum connections to be considered alive
     POLL_SEC     = 60
+    RAM_LOW_GB   = 2.0
 
-    # Per-clone /proc/stat baseline: {name: (ticks, timestamp)}
-    stat_baseline: Dict[str, tuple] = {}
-
-    async def _read_ticks(pid: str) -> Optional[int]:
-        """Read utime+stime from /proc/{pid}/stat in one su call."""
-        _, out, _ = await run_bash(f"su -c 'cat /proc/{pid}/stat 2>/dev/null'")
-        raw = out.strip()
-        if not raw:
-            return None
-        try:
-            fields = raw.split()
-            return int(fields[13]) + int(fields[14])
-        except (IndexError, ValueError):
-            return None
+    # Per-clone TCP low baseline: {name: timestamp when connections first dropped below TCP_MIN}
+    tcp_low_since: Dict[str, float] = {}
 
     while True:
         await asyncio.sleep(POLL_SEC)
@@ -158,7 +149,7 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                 if ":" in name:
                     continue
                 if state != CloneState.RUNNING:
-                    stat_baseline.pop(name, None)
+                    tcp_low_since.pop(name, None)
                     continue
 
                 suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
@@ -167,7 +158,7 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                 # ── Stage 1: Liveness ─────────────────────────────────────────
                 alive = await clone_pgrep_alive(suffix)
                 if not alive:
-                    stat_baseline.pop(name, None)
+                    tcp_low_since.pop(name, None)
                     logger.warning(f"Watchdog [{name}]: Stage1 — no process")
                     await watchdog_safe_restart(
                         application, bot_instance, name, "нет процесса (pgrep)"
@@ -181,48 +172,56 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
 
                 # Phantom: alive but 0 threads
                 if alive and thr == 0:
-                    stat_baseline.pop(name, None)
-                    logger.warning(f"Watchdog [{name}]: Stage2 — phantom (alive but 0 threads)")
+                    tcp_low_since.pop(name, None)
+                    logger.warning(f"Watchdog [{name}]: Stage2 — phantom (alive, 0 threads)")
                     bot_instance.set_state(name, CloneState.STOPPED)
                     asyncio.create_task(bot_instance._enqueue_start(name,
                         bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None))
                     continue
 
                 if uptime >= GRACE_SEC and thr < MIN_THREADS:
-                    stat_baseline.pop(name, None)
+                    tcp_low_since.pop(name, None)
                     logger.warning(f"Watchdog [{name}]: Stage2 — threads {thr} < {MIN_THREADS}")
                     await watchdog_safe_restart(
                         application, bot_instance, name, f"потоки {thr} < {MIN_THREADS}"
                     )
                     continue
 
-                # ── Stage 3: Freeze (/proc/stat delta) ────────────────────────
-                if uptime >= GRACE_SEC and pid:
-                    ticks_now = await _read_ticks(pid)
-                    if ticks_now is not None:
-                        baseline = stat_baseline.get(name)
-                        if baseline is None:
-                            stat_baseline[name] = (ticks_now, now)
-                        else:
-                            ticks_prev, ts_prev = baseline
-                            if ticks_now == ticks_prev:
-                                # No CPU activity
-                                if now - ts_prev >= FREEZE_SEC:
-                                    stat_baseline.pop(name, None)
-                                    logger.warning(
-                                        f"Watchdog [{name}]: Stage3 — frozen {FREEZE_SEC}s (ticks unchanged)"
-                                    )
-                                    await watchdog_safe_restart(
-                                        application, bot_instance, name,
-                                        f"заморожен {FREEZE_SEC}s (CPU delta=0)"
-                                    )
-                                    continue
-                                # else: still within window, keep baseline
-                            else:
-                                # Activity detected — reset baseline
-                                stat_baseline[name] = (ticks_now, now)
+                # ── Stage 3: TCP Connection Guard ─────────────────────────────
+                if uptime >= GRACE_SEC:
+                    conns = await MonitorEngine.get_clone_connections(suffix)
+                    # Store connections in state for UI
+                    bot_instance.clone_states[f"{name}:cpu"] = str(conns)
+                    tcp_label = MonitorEngine.classify_connections(conns)
+
+                    if conns < TCP_MIN:
+                        t0 = tcp_low_since.get(name)
+                        if t0 is None:
+                            tcp_low_since[name] = now
+                        elif now - t0 >= TCP_LOW_SEC:
+                            tcp_low_since.pop(name, None)
+                            logger.warning(
+                                f"Watchdog [{name}]: Stage3 — TCP {conns} < {TCP_MIN} for {TCP_LOW_SEC}s ({tcp_label})"
+                            )
+                            await watchdog_safe_restart(
+                                application, bot_instance, name,
+                                f"TCP {conns} соед. < {TCP_MIN} в течение {TCP_LOW_SEC}с"
+                            )
+                            continue
                     else:
-                        stat_baseline.pop(name, None)
+                        tcp_low_since.pop(name, None)
+
+            # ── RAM Guard: auto drop_caches if free RAM < 2 GB ────────────────
+            try:
+                ram_str = await MonitorEngine.get_ram_free_gb()
+                # Parse "X.X GB free"
+                import re as _re
+                m_ram = _re.search(r"([\d.]+)\s*GB", ram_str)
+                if m_ram and float(m_ram.group(1)) < RAM_LOW_GB:
+                    logger.warning(f"Watchdog: RAM {ram_str} < {RAM_LOW_GB}GB → drop_caches")
+                    await run_bash("su -c 'sync; echo 3 > /proc/sys/vm/drop_caches'")
+            except Exception:
+                pass
 
             await bot_instance.refresh_dashboard()
         except Exception as e:
@@ -425,34 +424,35 @@ class AegisBot:
         async def collect_one(clone_name: str) -> Tuple[str, str, str, str, str]:
             name_disp = clone_name.replace("_", "-")
             sfx = clone_name[-1].lower() if clone_name.lower().startswith("clien") else clone_name.lower()
-            cpu = -1.0
+            conns = 0
             try:
-                alive, st, cpu = await asyncio.gather(
+                alive, st, conns = await asyncio.gather(
                     clone_pgrep_alive(sfx),
                     MonitorEngine.get_clone_status(clone_name),
-                    MonitorEngine.get_clone_cpu_percent(sfx),
+                    MonitorEngine.get_clone_connections(sfx),
                 )
                 m_thr = re.search(r"Thr:\s*(\d+)", st)
                 thr = int(m_thr.group(1)) if m_thr else 0
-                cpu_str = f"{cpu:.0f}" if cpu >= 0 else "—"
+                con_str = str(conns)
             except Exception as e:
                 logger.error(f"hub collect_one [{clone_name}]: {e}")
-                alive, thr, cpu_str = False, 0, "—"
-                cpu = -1.0
+                alive, thr, con_str = False, 0, "0"
+                conns = 0
             self.clone_states[f"{clone_name}:threads"] = str(thr)
-            self.clone_states[f"{clone_name}:cpu"] = cpu_str
+            self.clone_states[f"{clone_name}:cpu"] = con_str   # reuse ":cpu" key for connections
             cstate = self.clone_states.get(clone_name, CloneState.STOPPED)
+            # Healthy = RUNNING + alive + threads OK + at least 10 TCP connections (in-game)
             healthy = (
                 cstate == CloneState.RUNNING
                 and alive
                 and thr >= 130
-                and cpu >= 2.0
+                and conns >= 10
             )
             return (
                 name_disp,
                 str(cstate),
                 str(thr),
-                cpu_str,
+                con_str,
                 "1" if healthy else "0",
             )
 
@@ -685,23 +685,29 @@ class AegisBot:
             # ── GK: Ghost Killer — strict liveness via ps -A (zombie-aware) ──
             alive = await clone_pgrep_alive(suffix)
             if alive:
-                # Check for phantom: alive but 0 threads = black screen / zombie ghost
+                # TCP check: 0 connections = phantom (zombie/ghost process)
+                conns = await MonitorEngine.get_clone_connections(suffix)
                 pid = await MonitorEngine.get_pid(suffix)
                 thr = await MonitorEngine.get_threads(pid) if pid else 0
-                if thr == 0:
-                    # Phantom detected — force-stop and proceed with launch
-                    logger.warning(f"_enqueue_start [{name}]: phantom (alive, threads=0) — killing")
+
+                is_phantom = (thr == 0) or (conns == 0)
+                if is_phantom:
+                    logger.warning(
+                        f"_enqueue_start [{name}]: phantom detected "
+                        f"(alive=True, threads={thr}, conns={conns}) — force-stop"
+                    )
                     await run_bash(f"su -c 'am force-stop {pkg}'")
                     await asyncio.sleep(3)
                 else:
-                    # Process is genuinely running — mark it and skip injection
+                    # Genuinely running — mark and skip injection
                     self.set_state(name, CloneState.RUNNING)
                     app = self.application
                     if chat_id and app:
                         try:
                             await app.bot.send_message(
                                 chat_id,
-                                f"👁 <code>{html.escape(name.replace('_','-'))}</code> уже запущен.",
+                                f"👁 <code>{html.escape(name.replace('_','-'))}</code> "
+                                f"уже запущен ({conns} TCP).",
                                 parse_mode="HTML")
                         except Exception: pass
                     return
@@ -773,12 +779,15 @@ class AegisBot:
         if not (chat_id and app): return
 
         try:
-            m = await app.bot.send_message(chat_id, "🚀 Staggered Start V2…", parse_mode="HTML")
+            m = await app.bot.send_message(chat_id, "🚀 Staggered Start V10.5…", parse_mode="HTML")
 
-            # Step 1: kill everything
-            await m.edit_text("☠️ pkill -9 all roblox…", parse_mode="HTML")
-            await run_bash("su -c 'pkill -9 com.roblox'")
-            await asyncio.sleep(2)
+            # Step 1: nuclear clean — kill ALL phantoms + python stale + drop caches
+            await m.edit_text("☠️ Nuclear clean…", parse_mode="HTML")
+            await run_bash(
+                "su -c 'pkill -9 com.roblox; pkill -9 python; "
+                "sync; echo 3 > /proc/sys/vm/drop_caches'"
+            )
+            await asyncio.sleep(3)
 
             # Step 2: reset all JSON statuses to idle in one pass
             for c in self.config.clones_data:
