@@ -15,10 +15,24 @@ def _hub_emoji(state: str, healthy: bool) -> str:
     if s == "STARTING":
         return "⏳"
     if s == "RUNNING" and healthy:
-        return "🟢"
+        return "🟢"   # ACTIVE: ≥45 TCP
     if s == "RUNNING":
-        return "🟡"
-    return "🔴"
+        return "🟡"   # LOADING: 1-44 TCP
+    return "🔴"       # IDLE / STOPPED
+
+
+def _tcp_status_label(con_val: int, state: str) -> str:
+    """V10.6 TCP-based status label for hub display."""
+    s = str(state).upper()
+    if s == "STARTING":
+        return "START…"
+    if s != "RUNNING":
+        return "IDLE"
+    if con_val >= 45:
+        return "ACTIVE"
+    if con_val >= 1:
+        return "LOADING"
+    return "STUCK"
 
 
 class UIManager:
@@ -112,13 +126,14 @@ class UIManager:
             else:
                 st_label = "IDLE"
             cpu_display = f"{cpu_raw}%" if cpu_raw != "—" else "0%"
-            # cpu_raw field now stores TCP connection count (watchdog writes it via ":cpu" key)
+            # cpu_raw field stores TCP connection count (written via ":cpu" state key)
             try:
                 con_val = int(cpu_raw) if cpu_raw not in ("—", "") else 0
             except (ValueError, TypeError):
                 con_val = 0
+            tcp_lbl = _tcp_status_label(con_val, state)
             lines.append(
-                f"<code>[{letter}] {emoji} {st_label:<6}  {nick_esc:<12}  {thr_val:<5}  {con_val}</code>"
+                f"<code>[{letter}] {emoji} {tcp_lbl:<6}  {nick_esc:<12}  {thr_val:<5}  {con_val}</code>"
             )
 
         lines.append(SEP)

@@ -128,18 +128,19 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
     Three-stage guardian — runs every 60 s per clone:
     Stage 1 — Liveness:   pgrep returns no PID → RESTART
     Stage 2 — Threads:    threads < 145 after grace → RESTART; threads==0 → phantom kill
-    Stage 3 — TCP Guard:  netstat connections < 3 for 120s → RESTART (zombie/frozen)
-    RAM Guard: free RAM < 2 GB → drop_caches once per cycle
+    Stage 3 — TCP Guard:  connections < TCP_STUCK(40) → immediate restart (no wait)
+               connections >= TCP_ACTIVE(45) → fully healthy
+    RAM Guard: free RAM < 2 GB → sync (no drop_caches — read-only on some ROMs)
     """
     GRACE_SEC    = 120
     MIN_THREADS  = 145
-    TCP_LOW_SEC  = 120   # seconds of <3 connections before restart
-    TCP_MIN      = 3     # minimum connections to be considered alive
+    TCP_ACTIVE   = 45    # healthy threshold (real-world: 60-64 conns)
+    TCP_STUCK    = 40    # below this → zombie → immediate restart
     POLL_SEC     = 60
     RAM_LOW_GB   = 2.0
 
-    # Per-clone TCP low baseline: {name: timestamp when connections first dropped below TCP_MIN}
-    tcp_low_since: Dict[str, float] = {}
+    # No wait timer — STUCK triggers immediate restart
+    tcp_low_since: Dict[str, float] = {}  # kept for future use
 
     while True:
         await asyncio.sleep(POLL_SEC)
@@ -194,32 +195,26 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                     bot_instance.clone_states[f"{name}:cpu"] = str(conns)
                     tcp_label = MonitorEngine.classify_connections(conns)
 
-                    if conns < TCP_MIN:
-                        t0 = tcp_low_since.get(name)
-                        if t0 is None:
-                            tcp_low_since[name] = now
-                        elif now - t0 >= TCP_LOW_SEC:
-                            tcp_low_since.pop(name, None)
-                            logger.warning(
-                                f"Watchdog [{name}]: Stage3 — TCP {conns} < {TCP_MIN} for {TCP_LOW_SEC}s ({tcp_label})"
-                            )
-                            await watchdog_safe_restart(
-                                application, bot_instance, name,
-                                f"TCP {conns} соед. < {TCP_MIN} в течение {TCP_LOW_SEC}с"
-                            )
-                            continue
-                    else:
+                    if conns < TCP_STUCK:
+                        # Immediate restart — no grace period for STUCK state
                         tcp_low_since.pop(name, None)
+                        tcp_lbl = MonitorEngine.classify_connections(conns)
+                        logger.warning(
+                            f"Watchdog [{name}]: Stage3 — TCP {conns} < {TCP_STUCK} ({tcp_lbl}) → restart"
+                        )
+                        await watchdog_safe_restart(
+                            application, bot_instance, name,
+                            f"TCP {conns} соед. (STUCK, порог {TCP_STUCK})"
+                        )
+                        continue
 
-            # ── RAM Guard: auto drop_caches if free RAM < 2 GB ────────────────
+            # ── RAM Guard: sync if free RAM < 2 GB (no drop_caches — read-only FS) ──
             try:
                 ram_str = await MonitorEngine.get_ram_free_gb()
-                # Parse "X.X GB free"
-                import re as _re
-                m_ram = _re.search(r"([\d.]+)\s*GB", ram_str)
+                m_ram = re.search(r"([\d.]+)\s*GB", ram_str)
                 if m_ram and float(m_ram.group(1)) < RAM_LOW_GB:
-                    logger.warning(f"Watchdog: RAM {ram_str} < {RAM_LOW_GB}GB → drop_caches")
-                    await run_bash("su -c 'sync; echo 3 > /proc/sys/vm/drop_caches'")
+                    logger.warning(f"Watchdog: RAM {ram_str} < {RAM_LOW_GB}GB → sync")
+                    await run_bash("su -c 'sync'")
             except Exception:
                 pass
 
@@ -690,16 +685,18 @@ class AegisBot:
                 pid = await MonitorEngine.get_pid(suffix)
                 thr = await MonitorEngine.get_threads(pid) if pid else 0
 
-                is_phantom = (thr == 0) or (conns == 0)
-                if is_phantom:
+                # Threshold: <40 conns = STUCK/zombie → silent force-stop + relaunch
+                is_stuck = (thr == 0) or (conns < 40)
+                if is_stuck:
                     logger.warning(
-                        f"_enqueue_start [{name}]: phantom detected "
-                        f"(alive=True, threads={thr}, conns={conns}) — force-stop"
+                        f"_enqueue_start [{name}]: stuck/phantom "
+                        f"(threads={thr}, conns={conns}) — soft_clean + relaunch"
                     )
-                    await run_bash(f"su -c 'am force-stop {pkg}'")
+                    await self._soft_clean(suffix)
                     await asyncio.sleep(3)
+                    # fall through to launch below
                 else:
-                    # Genuinely running — mark and skip injection
+                    # Genuinely active (≥40 TCP) — skip injection
                     self.set_state(name, CloneState.RUNNING)
                     app = self.application
                     if chat_id and app:
@@ -707,7 +704,7 @@ class AegisBot:
                             await app.bot.send_message(
                                 chat_id,
                                 f"👁 <code>{html.escape(name.replace('_','-'))}</code> "
-                                f"уже запущен ({conns} TCP).",
+                                f"активен ({conns} TCP).",
                                 parse_mode="HTML")
                         except Exception: pass
                     return
@@ -729,12 +726,9 @@ class AegisBot:
                 except Exception:
                     pass
 
-            # ── V10.1: Force-stop + 5s RAM release + grouped deep clean ──────
-            await run_bash(
-                f"su -c 'am force-stop {pkg}; sync; echo 3 > /proc/sys/vm/drop_caches; "
-                f"rm -rf /data/data/{pkg}/cache/*'"
-            )
-            await asyncio.sleep(5)  # allow system to fully reclaim RAM
+            # ── V10.6: Soft clean (no drop_caches — read-only FS) ───────────
+            await self._soft_clean(suffix)
+            await asyncio.sleep(5)  # let system reclaim RAM
 
             import json as _json
             p_id, l_code = None, None
@@ -757,12 +751,49 @@ class AegisBot:
             else:
                 self.set_state(name, CloneState.STOPPED)
 
+        # ── V10.6: 90s startup grace check ───────────────────────────────────
+        if self.clone_states.get(name) == CloneState.RUNNING:
+            await asyncio.sleep(90)
+            grace_conns = await MonitorEngine.get_clone_connections(suffix)
+            if grace_conns < 45:
+                logger.warning(
+                    f"Grace check [{name}]: conns={grace_conns} < 45 after 90s — retry"
+                )
+                admin = self.config.admin_ids[0] if self.config.admin_ids else None
+                app_ref = self.application
+                if admin and app_ref:
+                    try:
+                        await app_ref.bot.send_message(
+                            admin,
+                            f"⚠️ <code>{html.escape(name.replace('_','-'))}</code> "
+                            f"grace fail ({grace_conns} TCP) → retry",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                self.set_state(name, CloneState.STOPPED)
+                # Retry once
+                asyncio.create_task(self._enqueue_start(name, admin))
+                return
+
         await asyncio.sleep(10)
         await self.refresh_dashboard(force=True)
 
+    async def _soft_clean(self, suffix: str) -> None:
+        """
+        Soft clean for a single clone:
+        - am force-stop (kill phantom process)
+        - rm cache (free stored data)
+        NOTE: No drop_caches — /proc/sys/vm is read-only on some Android ROMs.
+        """
+        pkg = f"com.roblox.clien{suffix}"
+        await run_bash(
+            f"su -c 'am force-stop {pkg}; rm -rf /data/data/{pkg}/cache/*'"
+        )
+
     async def _do_deep_clean(self) -> None:
-        """Global deep clean: grouped single su call."""
-        await run_bash("su -c 'sync; echo 3 > /proc/sys/vm/drop_caches'")
+        """Global deep clean: sync only (no drop_caches — read-only on some ROMs)."""
+        await run_bash("su -c 'sync'")
 
     async def _mass_start(self, chat_id):
         """

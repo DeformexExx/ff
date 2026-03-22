@@ -308,19 +308,24 @@ class MonitorEngine:
         except ValueError:
             return 0
 
+    # Real-world thresholds (observed: healthy clone holds 60-64 TCP connections)
+    TCP_ACTIVE  = 45   # ≥45 → fully active in-game
+    TCP_STUCK   = 40   # <40 → zombie/stuck → restart
+
     @staticmethod
     def classify_connections(conns: int) -> str:
         """
-        Return TCP status label based on connection count.
-        0-2  → ZOMBIE  (crashed / frozen)
-        3-9  → LOADING (joining server)
-        10+  → RUNNING (fully active in-game)
+        Return TCP status label based on calibrated real-world thresholds.
+        0        → IDLE    (not running)
+        1-44     → LOADING (joining / warming up)
+        ≥45      → ACTIVE  (fully in-game, 60-64 typical)
+        <40 live → STUCK   (zombie — triggers restart)
         """
-        if conns >= 10:
-            return "RUNNING"
-        if conns >= 3:
+        if conns >= MonitorEngine.TCP_ACTIVE:
+            return "ACTIVE"
+        if conns > 0:
             return "LOADING"
-        return "ZOMBIE"
+        return "IDLE"
 
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
