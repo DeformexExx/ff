@@ -69,6 +69,7 @@ class PersistenceManager:
         self.target_states: dict  = {}   # {clone_name: "RUNNING"/"STOPPED"}
         self.auto_restore: bool   = True
         self.console_mode: bool   = False
+        self.silent_mode:  bool   = True   # V12.2: suppress per-clone messages
         # session_state.json data: {clone_name: {"enabled": bool, "ts": epoch}}
         self.session_state: dict  = {}
         # ────────────────────────────────────────────────────────────────────
@@ -86,6 +87,7 @@ class PersistenceManager:
 
             self.auto_restore  = d.get("auto_restore", True)
             self.console_mode  = d.get("console_mode", False)
+            self.silent_mode   = d.get("silent_mode", True)
             self.target_states = d.get("target_states", {})
 
             # active_clones list
@@ -119,6 +121,7 @@ class PersistenceManager:
             payload = {
                 "auto_restore":  self.auto_restore,
                 "console_mode":  self.console_mode,
+                "silent_mode":   self.silent_mode,
                 "active_clones": self.active_clones,
                 "targets":       self.targets,
                 "target_states": self.target_states,

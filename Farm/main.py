@@ -80,7 +80,7 @@ VERSION = "12.2"
 # ── V12.2 Configuration Constants ────────────────────────────────────────────
 ENABLE_AUTO_REBOOT = True       # Auto-reboot device when RAM >= 98%
 REBOOT_AT_PERCENT  = 98         # RAM usage % threshold for emergency reboot
-SILENT_MODE        = True       # Suppress per-clone messages (AutoResume, ✅, 🔄 [1/N])
+# SILENT_MODE is now persisted via PersistenceManager.silent_mode (toggle in System menu)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -508,7 +508,8 @@ class AegisBot:
     async def _open_system(self, update: Update):
         await update.message.reply_text(
             "Система",
-            reply_markup=UIManager.get_system_keyboard(self._console_on, self.persistence.auto_restore),
+            reply_markup=UIManager.get_system_keyboard(
+                self._console_on, self.persistence.auto_restore, self.persistence.silent_mode),
             parse_mode="HTML"
         )
 
@@ -686,14 +687,25 @@ class AegisBot:
                 self.persistence.save()
                 try:
                     await q.edit_message_reply_markup(
-                        UIManager.get_system_keyboard(self._console_on, self.persistence.auto_restore))
+                        UIManager.get_system_keyboard(
+                            self._console_on, self.persistence.auto_restore, self.persistence.silent_mode))
+                except Exception: pass
+
+            elif d == "toggle_silent":
+                self.persistence.silent_mode = not self.persistence.silent_mode
+                self.persistence.save()
+                try:
+                    await q.edit_message_reply_markup(
+                        UIManager.get_system_keyboard(
+                            self._console_on, self.persistence.auto_restore, self.persistence.silent_mode))
                 except Exception: pass
 
             elif d == "toggle_console":
                 await self._toggle_console(context, chat)
                 try:
                     await q.edit_message_reply_markup(
-                        UIManager.get_system_keyboard(self._console_on, self.persistence.auto_restore))
+                        UIManager.get_system_keyboard(
+                            self._console_on, self.persistence.auto_restore, self.persistence.silent_mode))
                 except Exception: pass
 
             elif d == "sys_sync":  await self._git_sync(chat)
@@ -825,7 +837,7 @@ class AegisBot:
 
             sm = None
             app = self.application
-            if chat_id and app and not SILENT_MODE:
+            if chat_id and app and not self.persistence.silent_mode:
                 try:
                     sm = await app.bot.send_message(
                         chat_id,
@@ -993,7 +1005,7 @@ class AegisBot:
 
                 # Mark enabled in session_state BEFORE launch
                 self.persistence.set_clone_enabled(name, True)
-                if not SILENT_MODE:
+                if not self.persistence.silent_mode:
                     await app.bot.send_message(
                         chat_id,
                         f"[{idx}/{len(clones)}] <code>{html.escape(name.replace('_', '-'))}</code>",
@@ -1236,7 +1248,7 @@ class AegisBot:
         logger.info(f"AutoResume: {len(enabled_clones)} clone(s) to restore: {enabled_clones}")
         admin = self.config.admin_ids[0] if self.config.admin_ids else None
 
-        if admin and self.application and not SILENT_MODE:
+        if admin and self.application and not self.persistence.silent_mode:
             try:
                 await self.application.bot.send_message(
                     admin,
@@ -1281,7 +1293,7 @@ class AegisBot:
                     await asyncio.sleep(3)
 
             logger.info(f"AutoResume [{idx}/{len(enabled_clones)}]: launching {name}")
-            if admin and self.application and not SILENT_MODE:
+            if admin and self.application and not self.persistence.silent_mode:
                 try:
                     await self.application.bot.send_message(
                         admin,

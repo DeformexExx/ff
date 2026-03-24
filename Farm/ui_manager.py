@@ -106,13 +106,15 @@ class UIManager:
         )
 
     @staticmethod
-    def get_system_keyboard(console_on: bool, restore_on: bool) -> InlineKeyboardMarkup:
+    def get_system_keyboard(console_on: bool, restore_on: bool, silent_on: bool = True) -> InlineKeyboardMarkup:
         c = "вкл" if console_on else "выкл"
         r = "вкл" if restore_on else "выкл"
+        s = "вкл" if silent_on else "выкл"
         return InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton(f"Консоль: {c}", callback_data="toggle_console")],
                 [InlineKeyboardButton(f"AutoResume: {r}", callback_data="toggle_restore")],
+                [InlineKeyboardButton(f"Silent Mode: {s}", callback_data="toggle_silent")],
                 [InlineKeyboardButton("⬅️ В меню", callback_data="nav_home")],
             ]
         )
