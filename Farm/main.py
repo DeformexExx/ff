@@ -283,32 +283,42 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                 pass
 
             # ── V12.2 RAM-Killer: emergency reboot at 98% usage ──────────
+            #    Uses: cat /proc/meminfo
+            #    Formula: Used% = (MemTotal - MemAvailable) / MemTotal * 100
+            #    Fallback if no MemAvailable: Total - (Free + Buffers + Cached)
+            #    Threshold: > 98% → su -c 'sync && reboot'
             if ENABLE_AUTO_REBOOT:
                 try:
-                    _, mem_out, _ = await run_bash("free -m")
-                    for mem_line in mem_out.splitlines():
-                        if "Mem:" in mem_line:
-                            parts = mem_line.split()
-                            total_mb = int(parts[1])
-                            used_mb = int(parts[2])
-                            ram_percent = (used_mb / total_mb) * 100 if total_mb > 0 else 0
-                            if ram_percent >= REBOOT_AT_PERCENT:
-                                logger.critical(
-                                    f"!!! CRITICAL RAM: {ram_percent:.1f}% >= {REBOOT_AT_PERCENT}% "
-                                    f"({used_mb}/{total_mb}MB) !!! Rebooting…"
-                                )
-                                admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
-                                if admin_id and application:
-                                    try:
-                                        await application.bot.send_message(
-                                            admin_id,
-                                            f"🔴 <b>CRITICAL RAM {ram_percent:.1f}%</b> — rebooting device!",
-                                            parse_mode="HTML",
-                                        )
-                                    except Exception:
-                                        pass
-                                await run_bash("su -c 'sync && reboot'")
-                            break
+                    _, _mi, _ = await run_bash("cat /proc/meminfo")
+                    def _parse_kb(key: str) -> int:
+                        m = re.search(rf"{key}:\s+(\d+)", _mi)
+                        return int(m.group(1)) if m else 0
+                    mem_total = _parse_kb("MemTotal")
+                    mem_avail = _parse_kb("MemAvailable")
+                    if mem_avail == 0:
+                        # Fallback: Total - (Free + Buffers + Cached)
+                        mem_avail = _parse_kb("MemFree") + _parse_kb("Buffers") + _parse_kb("Cached")
+                    if mem_total > 0:
+                        ram_percent = ((mem_total - mem_avail) / mem_total) * 100
+                        if ram_percent > REBOOT_AT_PERCENT:
+                            used_mb = (mem_total - mem_avail) // 1024
+                            total_mb = mem_total // 1024
+                            logger.critical(
+                                f"!!! CRITICAL RAM: {ram_percent:.1f}% > {REBOOT_AT_PERCENT}% "
+                                f"({used_mb}/{total_mb}MB) !!! Rebooting…"
+                            )
+                            admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                            if admin_id and application:
+                                try:
+                                    await application.bot.send_message(
+                                        admin_id,
+                                        f"🔴 <b>CRITICAL RAM {ram_percent:.1f}%</b> "
+                                        f"({used_mb}/{total_mb}MB) — rebooting device!",
+                                        parse_mode="HTML",
+                                    )
+                                except Exception:
+                                    pass
+                            await run_bash("su -c 'sync && reboot'")
                 except Exception as e:
                     logger.error(f"RAM-Killer check error: {e}")
 
@@ -336,7 +346,7 @@ class AegisBot:
         self.running_since: Dict[str, float] = {}
         self._start_lock = asyncio.Lock()
         self.is_mass_starting = False
-        self.is_aborting = False  # V12.2: set True by mass_stop to interrupt launch queue
+        self.abort_launch = False  # V12.2: set True by mass_stop to interrupt launch queue
         self.watchdog_cpu_low_since: Dict[str, Optional[float]] = {}
         self._last_sync_ts: float = 0.0  # timestamp of last hub refresh
         # V12.0: PID cache — {clone_name: pid_str}, updated on start, checked via /proc
@@ -350,7 +360,7 @@ class AegisBot:
     def reset_all_states(self):
         """Старт: все клоны в простое (IDLE), без автозапуска."""
         self.is_mass_starting = False
-        self.is_aborting = False
+        self.abort_launch = False
         self.watchdog_cpu_low_since.clear()
         for c in self.config.clones_data:
             n = c.get("name")
@@ -965,12 +975,12 @@ class AegisBot:
         - RAM-Check: if free < 600MB, delay 20s extra
         - Saves enabled state for each clone
         - SILENT_MODE: suppress per-clone messages
-        - is_aborting: instant abort on mass_stop
+        - abort_launch: instant abort on mass_stop
         """
-        STAGGER_SEC = 5
-        RAM_MIN_MB  = 200
+        STAGGER_SEC = 10
+        RAM_MIN_MB  = 600
         self.is_mass_starting = True
-        self.is_aborting = False  # V12.2: reset abort flag on new mass start
+        self.abort_launch = False  # V12.2: reset abort flag on new mass start
         clones = [c for c in self.config.clones_data if c.get("active", True)]
 
         app = self.application
@@ -990,9 +1000,8 @@ class AegisBot:
                     self.set_state(n, CloneState.STOPPED)
 
             for idx, c in enumerate(clones, 1):
-                if not self.is_mass_starting or self.is_aborting:
+                if not self.is_mass_starting or self.abort_launch:
                     logger.info("Mass Start: aborted by stop signal")
-                    self.is_aborting = False
                     break
                 name = c.get("name")
                 if not name:
@@ -1012,7 +1021,7 @@ class AegisBot:
                         parse_mode="HTML",
                     )
                 await self._enqueue_start(name, chat_id)
-                if idx < len(clones) and self.is_mass_starting and not self.is_aborting:
+                if idx < len(clones) and self.is_mass_starting and not self.abort_launch:
                     await asyncio.sleep(STAGGER_SEC)
         except Exception as e:
             logger.error(f"Mass Start Error: {e}")
@@ -1026,7 +1035,7 @@ class AegisBot:
         No pkill, no grouped commands — surgical per-clone stop.
         """
         self.is_mass_starting = False
-        self.is_aborting = True  # V12.2: signal any running launch queue to stop
+        self.abort_launch = True  # V12.2: signal any running launch queue to stop
         app = self.application
         if not (chat_id and app): return
 
@@ -1263,9 +1272,8 @@ class AegisBot:
 
         for idx, name in enumerate(enabled_clones, 1):
             # V12.2: check abort flag before each clone
-            if self.is_aborting:
+            if self.abort_launch:
                 logger.info("AutoResume: aborted by stop signal")
-                self.is_aborting = False
                 break
 
             # Verify clone exists in config
