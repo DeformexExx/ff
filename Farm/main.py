@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Aegis bot — V12.0 STABLE ARCHITECTURE
+# Aegis bot — V12.2 RAM-KILLER + SILENT-MODE + ABORT-FIX
 import os
 import sys
 import enum
@@ -75,7 +75,12 @@ from injection_engine    import InjectionEngine
 from bash_utils          import run_bash
 from persistence_manager import PersistenceManager
 
-VERSION = "12.0"
+VERSION = "12.2"
+
+# ── V12.2 Configuration Constants ────────────────────────────────────────────
+ENABLE_AUTO_REBOOT = True       # Auto-reboot device when RAM >= 98%
+REBOOT_AT_PERCENT  = 98         # RAM usage % threshold for emergency reboot
+SILENT_MODE        = True       # Suppress per-clone messages (AutoResume, ✅, 🔄 [1/N])
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,11 +116,12 @@ async def watchdog_hard_reset(
     reason: str,
 ) -> None:
     """
-    V12.0 Hard Reset Protocol:
-    1. su -c "am force-stop com.roblox.clien{suffix}"
-    2. su -c "rm -rf /data/data/com.roblox.clien{suffix}/cache/* code_cache/*"
-    3. Pause 3 seconds
-    4. Relaunch clone
+    V12.1 Hard Reset Protocol (Window-Safe):
+    1. am stack remove — detach floating window without collapsing others
+    2. am force-stop — kill the process
+    3. rm cache + code_cache
+    4. Pause 3 seconds
+    5. Relaunch clone
     NO drop_caches — filesystem is read-only.
     """
     suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
@@ -132,15 +138,35 @@ async def watchdog_hard_reset(
         except TelegramError:
             pass
 
-    # Step 1: force-stop
-    await run_bash(f"su -c 'am force-stop {pkg}'")
-    # Step 2: deep cache clean (cache + code_cache)
-    await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/* /data/data/{pkg}/code_cache/*'")
-    # Step 3: pause
+    # Steps 1-3: window-safe isolated stop + cache clean
+    await _isolated_stop(suffix)
+    # Step 4: pause
     await asyncio.sleep(3)
     bot_instance.set_state(name, CloneState.STOPPED)
     # Step 4: relaunch
     asyncio.create_task(bot_instance._enqueue_start(name, admin))
+
+
+async def _isolated_stop(suffix: str) -> None:
+    """
+    V12.1 Window-Safe Stop:
+    1. am stack remove — detach the floating window from the stack
+       (prevents collapsing other floating Roblox windows)
+    2. am force-stop — kill the process
+    3. rm cache/* + code_cache/* — free stored data
+    """
+    pkg = f"com.roblox.clien{suffix}"
+    # Step 1: detach floating window (ignore errors if no stack found)
+    await run_bash(
+        f'su -c "am stack remove $(su -c \\"dumpsys activity activities'
+        f" | grep {pkg} | grep 'Stack #' | cut -d '#' -f 2 | cut -d ' '"
+        f' -f 1\\")" 2>/dev/null'
+    )
+    # Step 2: force-stop the process
+    await run_bash(f"su -c 'am force-stop {pkg}'")
+    # Step 3: cache clean
+    await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/*'")
+    await run_bash(f"su -c 'rm -rf /data/data/{pkg}/code_cache/*'")
 
 
 async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
@@ -256,6 +282,36 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
             except Exception:
                 pass
 
+            # ── V12.2 RAM-Killer: emergency reboot at 98% usage ──────────
+            if ENABLE_AUTO_REBOOT:
+                try:
+                    _, mem_out, _ = await run_bash("free -m")
+                    for mem_line in mem_out.splitlines():
+                        if "Mem:" in mem_line:
+                            parts = mem_line.split()
+                            total_mb = int(parts[1])
+                            used_mb = int(parts[2])
+                            ram_percent = (used_mb / total_mb) * 100 if total_mb > 0 else 0
+                            if ram_percent >= REBOOT_AT_PERCENT:
+                                logger.critical(
+                                    f"!!! CRITICAL RAM: {ram_percent:.1f}% >= {REBOOT_AT_PERCENT}% "
+                                    f"({used_mb}/{total_mb}MB) !!! Rebooting…"
+                                )
+                                admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                                if admin_id and application:
+                                    try:
+                                        await application.bot.send_message(
+                                            admin_id,
+                                            f"🔴 <b>CRITICAL RAM {ram_percent:.1f}%</b> — rebooting device!",
+                                            parse_mode="HTML",
+                                        )
+                                    except Exception:
+                                        pass
+                                await run_bash("su -c 'sync && reboot'")
+                            break
+                except Exception as e:
+                    logger.error(f"RAM-Killer check error: {e}")
+
             await bot_instance.refresh_dashboard()
         except Exception as e:
             logger.error(f"watchdog_loop error: {e}")
@@ -280,6 +336,7 @@ class AegisBot:
         self.running_since: Dict[str, float] = {}
         self._start_lock = asyncio.Lock()
         self.is_mass_starting = False
+        self.is_aborting = False  # V12.2: set True by mass_stop to interrupt launch queue
         self.watchdog_cpu_low_since: Dict[str, Optional[float]] = {}
         self._last_sync_ts: float = 0.0  # timestamp of last hub refresh
         # V12.0: PID cache — {clone_name: pid_str}, updated on start, checked via /proc
@@ -293,6 +350,7 @@ class AegisBot:
     def reset_all_states(self):
         """Старт: все клоны в простое (IDLE), без автозапуска."""
         self.is_mass_starting = False
+        self.is_aborting = False
         self.watchdog_cpu_low_since.clear()
         for c in self.config.clones_data:
             n = c.get("name")
@@ -767,7 +825,7 @@ class AegisBot:
 
             sm = None
             app = self.application
-            if chat_id and app:
+            if chat_id and app and not SILENT_MODE:
                 try:
                     sm = await app.bot.send_message(
                         chat_id,
@@ -835,15 +893,13 @@ class AegisBot:
 
     async def _soft_clean(self, suffix: str) -> None:
         """
-        Safe Clean for a single clone before launch:
+        V12.1 Safe Clean for a single clone before launch:
+        - am stack remove (detach floating window)
         - am force-stop (kill phantom process)
         - rm cache + code_cache (free stored data, optimize RAM)
         NOTE: No drop_caches — /proc/sys/vm is read-only.
         """
-        pkg = f"com.roblox.clien{suffix}"
-        await run_bash(f"su -c 'am force-stop {pkg}'")
-        await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/*'")
-        await run_bash(f"su -c 'rm -rf /data/data/{pkg}/code_cache/*'")
+        await _isolated_stop(suffix)
 
     async def _do_deep_clean(self) -> None:
         """Global deep clean: sync only (no drop_caches — read-only on some ROMs)."""
@@ -890,16 +946,19 @@ class AegisBot:
 
     async def _mass_start(self, chat_id):
         """
-        V12.0 Intelligent Queue (Anti-Freeze Start):
+        V12.2 Intelligent Queue (Anti-Freeze Start):
         - NO nuclear clean (would kill Python process)
         - Per-clone Safe Clean before each launch
-        - 15s interval between launches
-        - RAM-Check: if free < 550MB, delay 20s extra
+        - 10s interval between launches
+        - RAM-Check: if free < 600MB, delay 20s extra
         - Saves enabled state for each clone
+        - SILENT_MODE: suppress per-clone messages
+        - is_aborting: instant abort on mass_stop
         """
-        STAGGER_SEC = 5
-        RAM_MIN_MB  = 150
+        STAGGER_SEC = 10
+        RAM_MIN_MB  = 600
         self.is_mass_starting = True
+        self.is_aborting = False  # V12.2: reset abort flag on new mass start
         clones = [c for c in self.config.clones_data if c.get("active", True)]
 
         app = self.application
@@ -908,7 +967,7 @@ class AegisBot:
         try:
             m = await app.bot.send_message(
                 chat_id,
-                f"🚀 Staggered Start V12.0 — {len(clones)} клонов (пауза {STAGGER_SEC}с + RAM check)…",
+                f"🚀 Staggered Start V12.2 — {len(clones)} клонов (пауза {STAGGER_SEC}с + RAM check)…",
                 parse_mode="HTML",
             )
 
@@ -919,26 +978,29 @@ class AegisBot:
                     self.set_state(n, CloneState.STOPPED)
 
             for idx, c in enumerate(clones, 1):
-                if not self.is_mass_starting:
+                if not self.is_mass_starting or self.is_aborting:
+                    logger.info("Mass Start: aborted by stop signal")
+                    self.is_aborting = False
                     break
                 name = c.get("name")
                 if not name:
                     continue
 
-                # V12.0 RAM-Check before each clone launch
+                # V12.2 RAM-Check before each clone launch
                 ram_ok = await self._wait_for_ram(RAM_MIN_MB, max_wait=60)
                 if not ram_ok:
                     logger.warning(f"Mass Start [{name}]: RAM still low after 60s, launching anyway")
 
                 # Mark enabled in session_state BEFORE launch
                 self.persistence.set_clone_enabled(name, True)
-                await app.bot.send_message(
-                    chat_id,
-                    f"[{idx}/{len(clones)}] <code>{html.escape(name.replace('_', '-'))}</code>",
-                    parse_mode="HTML",
-                )
+                if not SILENT_MODE:
+                    await app.bot.send_message(
+                        chat_id,
+                        f"[{idx}/{len(clones)}] <code>{html.escape(name.replace('_', '-'))}</code>",
+                        parse_mode="HTML",
+                    )
                 await self._enqueue_start(name, chat_id)
-                if idx < len(clones) and self.is_mass_starting:
+                if idx < len(clones) and self.is_mass_starting and not self.is_aborting:
                     await asyncio.sleep(STAGGER_SEC)
         except Exception as e:
             logger.error(f"Mass Start Error: {e}")
@@ -952,6 +1014,7 @@ class AegisBot:
         No pkill, no grouped commands — surgical per-clone stop.
         """
         self.is_mass_starting = False
+        self.is_aborting = True  # V12.2: signal any running launch queue to stop
         app = self.application
         if not (chat_id and app): return
 
@@ -963,17 +1026,13 @@ class AegisBot:
                 if not n:
                     continue
                 suffix = n[-1].lower() if n.lower().startswith("clien") else n.lower()
-                pkg = f"com.roblox.clien{suffix}"
-
                 # Reset bot state + session_state
                 self.set_state(n, CloneState.STOPPED)
                 self.persistence.remove_target(n)
                 self.persistence.set_clone_enabled(n, False)
 
-                # Surgical force-stop + cache clean for this clone
-                await run_bash(f"su -c 'am force-stop {pkg}'")
-                await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/*'")
-                await run_bash(f"su -c 'rm -rf /data/data/{pkg}/code_cache/*'")
+                # V12.1: Window-safe isolated stop + cache clean
+                await _isolated_stop(suffix)
                 await asyncio.sleep(1)  # 1s pause between clones
 
             await m.edit_text("🛑 Готово. Кэш всех клонов очищен.", parse_mode="HTML")
@@ -983,16 +1042,13 @@ class AegisBot:
         await self.refresh_dashboard(force=True)
 
     async def _stop_clone(self, name: Optional[str], chat_id):
-        """Stop a single clone — am force-stop + cache clean. Never pkill."""
+        """V12.1 Stop a single clone — window-safe isolated stop. Never pkill."""
         if not name: return
         self.set_state(name, CloneState.STOPPED)
         self.persistence.remove_target(name)
         suffix = name[-1].lower() if name.lower().startswith("clien") else name.lower()
-        pkg = f"com.roblox.clien{suffix}"
-        # Surgical: force-stop + cache clean for this clone only
-        await run_bash(f"su -c 'am force-stop {pkg}'")
-        await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/*'")
-        await run_bash(f"su -c 'rm -rf /data/data/{pkg}/code_cache/*'")
+        # V12.1: Window-safe isolated stop + cache clean
+        await _isolated_stop(suffix)
         await asyncio.sleep(2)  # let system free RAM
         app = self.application
         if chat_id and app:
@@ -1180,7 +1236,7 @@ class AegisBot:
         logger.info(f"AutoResume: {len(enabled_clones)} clone(s) to restore: {enabled_clones}")
         admin = self.config.admin_ids[0] if self.config.admin_ids else None
 
-        if admin and self.application:
+        if admin and self.application and not SILENT_MODE:
             try:
                 await self.application.bot.send_message(
                     admin,
@@ -1190,16 +1246,22 @@ class AegisBot:
             except Exception:
                 pass
 
-        STAGGER_SEC = 15
-        RAM_MIN_MB  = 550
+        STAGGER_SEC = 10
+        RAM_MIN_MB  = 600
 
         for idx, name in enumerate(enabled_clones, 1):
+            # V12.2: check abort flag before each clone
+            if self.is_aborting:
+                logger.info("AutoResume: aborted by stop signal")
+                self.is_aborting = False
+                break
+
             # Verify clone exists in config
             if not self.config.get_clone(name):
                 logger.warning(f"AutoResume: [{name}] not in config, skipping.")
                 continue
 
-            # V12.0: RAM-Check before each resume
+            # V12.2: RAM-Check before each resume
             ram_ok = await self._wait_for_ram(RAM_MIN_MB, max_wait=60)
             if not ram_ok:
                 logger.warning(f"AutoResume [{name}]: RAM still low after 60s, launching anyway")
@@ -1215,13 +1277,11 @@ class AegisBot:
                     continue
                 else:
                     logger.warning(f"AutoResume [{name}]: alive but CON={conns} → Hard Reset")
-                    pkg = f"com.roblox.clien{suffix}"
-                    await run_bash(f"su -c 'am force-stop {pkg}'")
-                    await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/* /data/data/{pkg}/code_cache/*'")
+                    await _isolated_stop(suffix)
                     await asyncio.sleep(3)
 
             logger.info(f"AutoResume [{idx}/{len(enabled_clones)}]: launching {name}")
-            if admin and self.application:
+            if admin and self.application and not SILENT_MODE:
                 try:
                     await self.application.bot.send_message(
                         admin,
@@ -1231,7 +1291,7 @@ class AegisBot:
                 except Exception:
                     pass
             asyncio.create_task(self._enqueue_start(name, admin))
-            # Staggered: wait 15s between launches
+            # Staggered: wait 10s between launches
             if idx < len(enabled_clones):
                 await asyncio.sleep(STAGGER_SEC)
 
