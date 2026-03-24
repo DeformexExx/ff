@@ -967,8 +967,8 @@ class AegisBot:
         - SILENT_MODE: suppress per-clone messages
         - is_aborting: instant abort on mass_stop
         """
-        STAGGER_SEC = 10
-        RAM_MIN_MB  = 600
+        STAGGER_SEC = 5
+        RAM_MIN_MB  = 200
         self.is_mass_starting = True
         self.is_aborting = False  # V12.2: reset abort flag on new mass start
         clones = [c for c in self.config.clones_data if c.get("active", True)]
