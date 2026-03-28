@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Aegis bot — V12.2 RAM-KILLER + SILENT-MODE + ABORT-FIX
+# Aegis bot — V12.3 FAILSAFE OOM + SYSRQ REBOOT
 import os
 import sys
 import enum
@@ -10,6 +10,7 @@ import tempfile
 import re
 import html
 import subprocess
+import multiprocessing
 from typing import Optional, Dict, Tuple
 
 _bot_dir = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +54,99 @@ def apply_immortality() -> None:
 # Apply immortality immediately at startup (before logging / arg parsing)
 apply_immortality()
 
+
+# ── V12.3 ROOT CHECK ─────────────────────────────────────────────────────────
+def check_root() -> bool:
+    """Verify root access via su -c 'id'. Returns True if root is available."""
+    try:
+        r = subprocess.run(
+            ["su", "-c", "id"], capture_output=True, text=True, timeout=10,
+        )
+        return r.returncode == 0 and "uid=0" in r.stdout
+    except Exception:
+        return False
+
+HAS_ROOT = check_root()
+if not HAS_ROOT:
+    print("❌ ROOT NOT AVAILABLE! su -c 'id' failed. Bot will NOT launch Roblox.")
+
+
+# ── V12.3 FAILSAFE RAM WATCHDOG (multiprocessing.Process) ────────────────────
+#    Runs as a SEPARATE PROCESS with os.nice(-20).
+#    Polls /proc/meminfo every 5 seconds.
+#    If MemAvailable < 100MB:
+#      1. Write crash_report.txt with free -m snapshot
+#      2. Kernel-level sysrq reboot (works even when system is frozen)
+RAM_FAILSAFE_MB = 100  # hard reboot threshold
+RAM_FAILSAFE_POLL = 5  # poll interval in seconds
+
+def _ram_failsafe_loop(farm_dir: str) -> None:
+    """Independent process: monitors RAM and reboots via sysrq if critical."""
+    # Set max priority for this watchdog process
+    try:
+        os.nice(-20)
+    except Exception:
+        pass
+    # OOM protection for this process too
+    pid = os.getpid()
+    try:
+        subprocess.run(
+            ["su", "-c", f"echo -17 > /proc/{pid}/oom_adj"],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+    while True:
+        try:
+            time.sleep(RAM_FAILSAFE_POLL)
+            with open("/proc/meminfo", "r") as f:
+                mi = f.read()
+            # Parse MemAvailable (or fallback)
+            def _kb(key):
+                m = re.search(rf"{key}:\s+(\d+)", mi)
+                return int(m.group(1)) if m else 0
+            avail_kb = _kb("MemAvailable")
+            if avail_kb == 0:
+                avail_kb = _kb("MemFree") + _kb("Buffers") + _kb("Cached")
+            avail_mb = avail_kb / 1024.0
+
+            if avail_mb < RAM_FAILSAFE_MB:
+                # ── CRASH REPORT: snapshot free -m before reboot ──────────
+                crash_path = os.path.join(farm_dir, "crash_report.txt")
+                try:
+                    r = subprocess.run(
+                        ["free", "-m"], capture_output=True, text=True, timeout=5,
+                    )
+                    snapshot = r.stdout if r.returncode == 0 else "free -m failed"
+                except Exception as e:
+                    snapshot = f"free -m error: {e}"
+                try:
+                    with open(crash_path, "a", encoding="utf-8") as cf:
+                        cf.write(f"\n{'='*60}\n")
+                        cf.write(f"FAILSAFE REBOOT @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        cf.write(f"MemAvailable: {avail_mb:.0f}MB (threshold: {RAM_FAILSAFE_MB}MB)\n")
+                        cf.write(f"--- free -m ---\n{snapshot}\n")
+                        cf.write(f"--- /proc/meminfo (excerpt) ---\n")
+                        for line in mi.splitlines()[:10]:
+                            cf.write(f"  {line}\n")
+                        cf.write(f"{'='*60}\n")
+                except Exception:
+                    pass
+
+                # ── SYSRQ REBOOT: kernel-level instant reboot ────────────
+                # This works even when the system is completely frozen
+                subprocess.run(
+                    ["su", "-c",
+                     "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"],
+                    timeout=10,
+                )
+                # Fallback if sysrq fails
+                time.sleep(3)
+                subprocess.run(["su", "-c", "reboot"], timeout=10)
+        except Exception:
+            pass  # Never crash — keep watching
+
 if len(sys.argv) < 2:
     print("❌  Usage: python main.py <DEVICE_ID>")
     sys.exit(1)
@@ -75,12 +169,12 @@ from injection_engine    import InjectionEngine
 from bash_utils          import run_bash
 from persistence_manager import PersistenceManager
 
-VERSION = "12.2"
+VERSION = "12.3"
 
-# ── V12.2 Configuration Constants ────────────────────────────────────────────
-ENABLE_AUTO_REBOOT = True       # Enable two-level OOM protection
+# ── V12.3 Configuration Constants ────────────────────────────────────────────
+ENABLE_AUTO_REBOOT = True       # Enable two-level OOM protection in watchdog
 RAM_LEVEL1_MB      = 250        # Level 1: kill oldest Roblox clone to free RAM
-RAM_LEVEL2_MB      = 150        # Level 2: emergency reboot (su -c "reboot")
+RAM_LEVEL2_MB      = 150        # Level 2: sysrq kernel reboot
 # SILENT_MODE is now persisted via PersistenceManager.silent_mode (toggle in System menu)
 
 logging.basicConfig(
@@ -303,7 +397,24 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                                 )
                             except Exception:
                                 pass
-                        await run_bash("su -c 'sync && reboot'")
+                        # Write crash_report.txt before reboot
+                        try:
+                            _, _free_out, _ = await run_bash("free -m")
+                            crash_path = os.path.join(FARM_DIR, "crash_report.txt")
+                            with open(crash_path, "a", encoding="utf-8") as cf:
+                                cf.write(f"\n{'='*60}\n")
+                                cf.write(f"WATCHDOG LEVEL2 REBOOT @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                cf.write(f"MemAvailable: {mem_avail_mb:.0f}MB < {RAM_LEVEL2_MB}MB\n")
+                                cf.write(f"--- free -m ---\n{_free_out}\n{'='*60}\n")
+                        except Exception:
+                            pass
+                        # Kernel-level sysrq reboot (works even if system frozen)
+                        await run_bash(
+                            'su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"'
+                        )
+                        # Fallback if sysrq fails
+                        await asyncio.sleep(3)
+                        await run_bash("su -c 'reboot'")
 
                     elif mem_avail_mb < RAM_LEVEL1_MB:
                         # ── LEVEL 1: LOW — kill oldest running clone ─────
@@ -819,6 +930,21 @@ class AegisBot:
 
     async def _enqueue_start(self, name: Optional[str], chat_id):
         if not name: return
+        # V12.3: Block Roblox launch if no root access
+        if not HAS_ROOT:
+            logger.error(f"_enqueue_start [{name}]: ROOT NOT AVAILABLE — launch blocked!")
+            app = self.application
+            if chat_id and app:
+                try:
+                    await app.bot.send_message(
+                        chat_id,
+                        f"❌ <b>ROOT НЕДОСТУПЕН!</b> Запуск <code>{html.escape(name)}</code> заблокирован.\n"
+                        f"Проверьте su -c 'id' на устройстве.",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+            return
         ci = self.config.get_clone(name)
         if not ci: return
 
@@ -1221,6 +1347,20 @@ class AegisBot:
     async def run(self):
         logger.info(f"Aegis V{VERSION} start — {DEVICE_ID}")
         # immortality already applied at module level before arg parsing
+
+        # V12.3: Start failsafe RAM watchdog as separate process
+        if HAS_ROOT and ENABLE_AUTO_REBOOT:
+            _failsafe_proc = multiprocessing.Process(
+                target=_ram_failsafe_loop,
+                args=(FARM_DIR,),
+                daemon=True,
+                name="aegis-ram-failsafe",
+            )
+            _failsafe_proc.start()
+            logger.info(f"Failsafe RAM watchdog started (PID {_failsafe_proc.pid}, "
+                         f"threshold={RAM_FAILSAFE_MB}MB, poll={RAM_FAILSAFE_POLL}s)")
+        elif not HAS_ROOT:
+            logger.warning("Failsafe RAM watchdog SKIPPED — no root access!")
 
         self.application = ApplicationBuilder().token(self.config.bot_token).build()
         app = self.application
