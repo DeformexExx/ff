@@ -184,7 +184,7 @@ VERSION = "12.4"
 ENABLE_AUTO_REBOOT = True       # Enable OOM protection + uptime reboot in watchdog
 # RAM_REBOOT_PERCENT = 98 — defined above (failsafe process uses it too)
 # RAM_WATCHDOG_POLL  = 10 — defined above
-UPTIME_REBOOT_SEC  = 9000       # V12.4: 2.5 hours → forced sysrq reboot
+UPTIME_REBOOT_SEC  = 5400       # V12.4: 1.5 hours → forced reboot (ugPhone cache cleanup)
 HEARTBEAT_SEC      = 30         # V12.4: heartbeat check interval (seconds)
 EMPTY_FARM_WAIT    = 120        # V12.4: seconds to wait before empty-farm guard triggers
 # SILENT_MODE is now persisted via PersistenceManager.silent_mode (toggle in System menu)
@@ -309,10 +309,150 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
     # V12.4: Empty farm guard — timestamp when farm first seen empty
     empty_farm_since: Optional[float] = None
 
+    def _do_reboot(reason: str) -> None:
+        """Save state then reboot via os.system — no async, no wrappers."""
+        try:
+            bot_instance.persistence.save()
+        except Exception:
+            pass
+        try:
+            crash_path = os.path.join(FARM_DIR, "crash_report.txt")
+            with open(crash_path, "a", encoding="utf-8") as cf:
+                cf.write(f"\n{'='*60}\n")
+                cf.write(f"REBOOT @ {time.strftime('%Y-%m-%d %H:%M:%S')} — {reason}\n")
+                cf.write(f"{'='*60}\n")
+        except Exception:
+            pass
+        print(f"[ACTION] THRESHOLD REACHED! INITIATING HARD REBOOT... ({reason})", flush=True)
+        logger.critical(f"[ACTION] HARD REBOOT: {reason}")
+        os.system('su -c "reboot"')
+        time.sleep(5)
+        os.system('su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"')
+        time.sleep(5)
+        os._exit(1)
+
     while True:
         await asyncio.sleep(POLL_SEC)
         try:
             now = time.time()
+
+            # ── PRIORITY 0: RAM + Uptime (checked FIRST every cycle) ──────
+            if ENABLE_AUTO_REBOOT:
+                try:
+                    with open("/proc/meminfo", "r") as _mf:
+                        _mi = _mf.read()
+                    def _pkb(key: str) -> int:
+                        m = re.search(rf"{key}:\s+(\d+)", _mi)
+                        return int(m.group(1)) if m else 0
+                    _total_kb = _pkb("MemTotal")
+                    _avail_kb = _pkb("MemAvailable")
+                    if _avail_kb == 0:
+                        _avail_kb = _pkb("MemFree") + _pkb("Buffers") + _pkb("Cached")
+                    _usage_pct = (_total_kb - _avail_kb) / _total_kb * 100.0 if _total_kb > 0 else 0.0
+                    _avail_mb  = _avail_kb / 1024.0
+                    _total_mb  = _total_kb / 1024.0
+
+                    with open("/proc/uptime", "r") as _uf:
+                        _uptime_s = float(_uf.read().split()[0])
+                    _uptime_min = _uptime_s / 60.0
+
+                    _running_n = sum(
+                        1 for n, s in bot_instance.clone_states.items()
+                        if ":" not in n and s == CloneState.RUNNING
+                    )
+                    print(
+                        f"[MEM] {_usage_pct:.1f}% ({_avail_mb:.0f}MB free / {_total_mb:.0f}MB) "
+                        f"| [UPTIME] {_uptime_min:.0f} min "
+                        f"| [CLONES] {_running_n} running "
+                        f"| [STATUS] {'CRITICAL' if _usage_pct >= RAM_REBOOT_PERCENT else 'OK'}",
+                        flush=True,
+                    )
+
+                    if _usage_pct >= RAM_REBOOT_PERCENT:
+                        # 98%+ → IMMEDIATE REBOOT, no clone killing
+                        admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                        if admin_id and application:
+                            try:
+                                await application.bot.send_message(
+                                    admin_id,
+                                    f"🔴 <b>RAM {_usage_pct:.1f}% >= {RAM_REBOOT_PERCENT}%</b> "
+                                    f"({_avail_mb:.0f}MB free) — REBOOT!",
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                pass
+                        _do_reboot(f"RAM {_usage_pct:.1f}% >= {RAM_REBOOT_PERCENT}%")
+
+                    elif _uptime_s >= UPTIME_REBOOT_SEC:
+                        # 1.5h uptime → scheduled reboot
+                        admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                        if admin_id and application:
+                            try:
+                                await application.bot.send_message(
+                                    admin_id,
+                                    f"🔄 <b>Uptime Reboot</b>: {_uptime_min:.0f} мин "
+                                    f"(лимит {UPTIME_REBOOT_SEC//60} мин) — перезагрузка",
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                pass
+                        _do_reboot(f"Uptime {_uptime_s:.0f}s >= {UPTIME_REBOOT_SEC}s")
+
+                    elif _usage_pct >= 90:
+                        # 90-97%: kill oldest clone → check if 0 alive → reboot or resurrect
+                        oldest_name = None
+                        oldest_ts = float("inf")
+                        for cname, cstate in bot_instance.clone_states.items():
+                            if ":" in cname:
+                                continue
+                            if cstate == CloneState.RUNNING:
+                                ts = bot_instance.running_since.get(cname, float("inf"))
+                                if ts < oldest_ts:
+                                    oldest_ts = ts
+                                    oldest_name = cname
+                        if oldest_name:
+                            sfx = oldest_name[-1].lower() if oldest_name.lower().startswith("clien") else oldest_name.lower()
+                            logger.warning(f"OOM: RAM {_usage_pct:.1f}% — killing oldest [{oldest_name}]")
+                            await _isolated_stop(sfx)
+                            bot_instance.set_state(oldest_name, CloneState.STOPPED)
+                            admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                            if admin_id and application:
+                                try:
+                                    await application.bot.send_message(
+                                        admin_id,
+                                        f"⚠️ <b>RAM {_usage_pct:.1f}%</b> — "
+                                        f"killed <code>{html.escape(oldest_name)}</code>",
+                                        parse_mode="HTML",
+                                    )
+                                except Exception:
+                                    pass
+                            # Check if 0 clones alive after kill → reboot
+                            alive_count = sum(
+                                1 for n, s in bot_instance.clone_states.items()
+                                if ":" not in n and s == CloneState.RUNNING
+                            )
+                            if alive_count == 0:
+                                _do_reboot(f"RAM {_usage_pct:.1f}% — 0 clones alive after kill")
+                            else:
+                                async def _resurrect_clone(rname, radmin):
+                                    await asyncio.sleep(10)
+                                    try:
+                                        with open("/proc/meminfo", "r") as _rf:
+                                            _rmi = _rf.read()
+                                        _rt = re.search(r"MemTotal:\s+(\d+)", _rmi)
+                                        _ra = re.search(r"MemAvailable:\s+(\d+)", _rmi)
+                                        _rpct = (int(_rt.group(1)) - int(_ra.group(1))) / int(_rt.group(1)) * 100 if _rt and _ra else 0
+                                    except Exception:
+                                        _rpct = 0
+                                    if _rpct >= 90:
+                                        logger.warning(f"Resurrect [{rname}]: RAM still {_rpct:.0f}% — skip")
+                                        return
+                                    logger.info(f"Resurrect [{rname}]: RAM {_rpct:.0f}% OK — relaunching")
+                                    await bot_instance._enqueue_start(rname, radmin)
+                                asyncio.create_task(_resurrect_clone(oldest_name, admin_id))
+                except Exception as e:
+                    logger.error(f"RAM/Uptime check error: {e}", exc_info=True)
+
             for name, state in list(bot_instance.clone_states.items()):
                 if ":" in name:
                     continue
@@ -458,174 +598,6 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                             await asyncio.sleep(10)
                 else:
                     empty_farm_since = None  # reset — farm is alive
-
-            # ── V12.4 Uptime Reboot: /proc/uptime > 2.5h → sysrq reboot ─
-            if ENABLE_AUTO_REBOOT and UPTIME_REBOOT_SEC > 0:
-                try:
-                    with open("/proc/uptime", "r") as _uf:
-                        _uptime_str = _uf.read().split()[0]
-                    device_uptime = float(_uptime_str)
-                    if device_uptime >= UPTIME_REBOOT_SEC:
-                        logger.warning(
-                            f"Uptime Reboot: device up {device_uptime:.0f}s "
-                            f"(>{UPTIME_REBOOT_SEC}s / {UPTIME_REBOOT_SEC/3600:.1f}h) → sysrq reboot"
-                        )
-                        admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
-                        if admin_id and application:
-                            try:
-                                await application.bot.send_message(
-                                    admin_id,
-                                    f"🔄 <b>Uptime Reboot</b>: устройство работает "
-                                    f"{device_uptime/3600:.1f}ч (лимит {UPTIME_REBOOT_SEC/3600:.1f}ч) "
-                                    f"— перезагрузка",
-                                    parse_mode="HTML",
-                                )
-                            except Exception:
-                                pass
-                        # Write crash_report before reboot
-                        try:
-                            crash_path = os.path.join(FARM_DIR, "crash_report.txt")
-                            with open(crash_path, "a", encoding="utf-8") as cf:
-                                cf.write(f"\n{'='*60}\n")
-                                cf.write(f"UPTIME REBOOT @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                                cf.write(f"Device uptime: {device_uptime:.0f}s ({device_uptime/3600:.1f}h)\n")
-                                cf.write(f"Threshold: {UPTIME_REBOOT_SEC}s ({UPTIME_REBOOT_SEC/3600:.1f}h)\n")
-                                cf.write(f"{'='*60}\n")
-                        except Exception:
-                            pass
-                        logger.critical(">>> UPTIME REBOOT: SYSRQ COMMAND EXECUTING <<<")
-                        await run_bash(
-                            'su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"',
-                            timeout=10,
-                        )
-                        logger.critical(">>> UPTIME REBOOT: SYSRQ FAILED, TRYING su -c reboot <<<")
-                        await asyncio.sleep(3)
-                        await run_bash("su -c 'reboot'", timeout=10)
-                        logger.critical(">>> UPTIME REBOOT: ALL REBOOT COMMANDS FAILED <<<")
-                        os._exit(1)
-                except Exception as e:
-                    logger.error(f"Uptime Reboot check error: {e}", exc_info=True)
-
-            # ── OOM Protection: percentage-based RAM guard ────────────────
-            #    >= 98%: IMMEDIATE reboot via os.system (no clone killing)
-            #    >= 90%: kill oldest clone + resurrect after 10s
-            #    V12.4: Direct /proc/meminfo read, os.system for reboot
-            if ENABLE_AUTO_REBOOT:
-                try:
-                    with open("/proc/meminfo", "r") as _mf:
-                        _mi = _mf.read()
-                    def _parse_kb(key: str) -> int:
-                        m = re.search(rf"{key}:\s+(\d+)", _mi)
-                        return int(m.group(1)) if m else 0
-                    _total_kb = _parse_kb("MemTotal")
-                    _avail_kb = _parse_kb("MemAvailable")
-                    if _avail_kb == 0:
-                        _avail_kb = _parse_kb("MemFree") + _parse_kb("Buffers") + _parse_kb("Cached")
-                    if _total_kb > 0:
-                        _usage_pct = (_total_kb - _avail_kb) / _total_kb * 100.0
-                        _avail_mb = _avail_kb / 1024.0
-                        _total_mb = _total_kb / 1024.0
-                    else:
-                        _usage_pct = 0.0
-                        _avail_mb = 9999.0
-                        _total_mb = 0.0
-
-                    if _usage_pct >= RAM_REBOOT_PERCENT:
-                        # ── 98%+ : IMMEDIATE REBOOT — no clone killing ───
-                        logger.critical(
-                            f"[WATCHDOG] Memory at {_usage_pct:.1f}% "
-                            f"({_avail_mb:.0f}MB free / {_total_mb:.0f}MB total). "
-                            f"Initiating SYSTEM REBOOT..."
-                        )
-                        print(
-                            f"[WATCHDOG] Memory at {_usage_pct:.1f}% "
-                            f"({_avail_mb:.0f}MB free / {_total_mb:.0f}MB total). "
-                            f"Initiating SYSTEM REBOOT...",
-                            flush=True,
-                        )
-                        admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
-                        if admin_id and application:
-                            try:
-                                await application.bot.send_message(
-                                    admin_id,
-                                    f"🔴 <b>RAM {_usage_pct:.1f}% ≥ {RAM_REBOOT_PERCENT}%</b> "
-                                    f"({_avail_mb:.0f}MB free) — REBOOT!",
-                                    parse_mode="HTML",
-                                )
-                            except Exception:
-                                pass
-                        # Crash report
-                        try:
-                            crash_path = os.path.join(FARM_DIR, "crash_report.txt")
-                            with open(crash_path, "a", encoding="utf-8") as cf:
-                                cf.write(f"\n{'='*60}\n")
-                                cf.write(f"WATCHDOG REBOOT @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                                cf.write(f"RAM: {_usage_pct:.1f}% ({_avail_mb:.0f}MB / {_total_mb:.0f}MB)\n")
-                                cf.write(f"{'='*60}\n")
-                        except Exception:
-                            pass
-                        # DIRECT REBOOT — os.system, no async wrappers
-                        logger.critical(">>> EXECUTING: os.system('su -c reboot') <<<")
-                        print(">>> EXECUTING: os.system('su -c reboot') <<<", flush=True)
-                        os.system('su -c "reboot"')
-                        time.sleep(5)
-                        logger.critical(">>> reboot failed, trying sysrq <<<")
-                        os.system('su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"')
-                        time.sleep(5)
-                        os._exit(1)
-
-                    elif _usage_pct >= 90:
-                        # ── 90-97%: kill oldest clone → resurrect ────────
-                        oldest_name = None
-                        oldest_ts = float("inf")
-                        for cname, cstate in bot_instance.clone_states.items():
-                            if ":" in cname:
-                                continue
-                            if cstate == CloneState.RUNNING:
-                                ts = bot_instance.running_since.get(cname, float("inf"))
-                                if ts < oldest_ts:
-                                    oldest_ts = ts
-                                    oldest_name = cname
-                        if oldest_name:
-                            sfx = oldest_name[-1].lower() if oldest_name.lower().startswith("clien") else oldest_name.lower()
-                            logger.warning(
-                                f"OOM: RAM {_usage_pct:.1f}% — killing oldest [{oldest_name}]"
-                            )
-                            await _isolated_stop(sfx)
-                            bot_instance.set_state(oldest_name, CloneState.STOPPED)
-                            admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
-                            if admin_id and application:
-                                try:
-                                    await application.bot.send_message(
-                                        admin_id,
-                                        f"⚠️ <b>RAM {_usage_pct:.1f}%</b> — "
-                                        f"killed <code>{html.escape(oldest_name)}</code> → resurrect 10s",
-                                        parse_mode="HTML",
-                                    )
-                                except Exception:
-                                    pass
-                            # Resurrect with RAM re-check
-                            async def _resurrect_clone(rname, radmin):
-                                await asyncio.sleep(10)
-                                try:
-                                    with open("/proc/meminfo", "r") as _rf:
-                                        _rmi = _rf.read()
-                                    _rt = re.search(r"MemTotal:\s+(\d+)", _rmi)
-                                    _ra = re.search(r"MemAvailable:\s+(\d+)", _rmi)
-                                    if _rt and _ra:
-                                        _rpct = (int(_rt.group(1)) - int(_ra.group(1))) / int(_rt.group(1)) * 100
-                                    else:
-                                        _rpct = 0
-                                except Exception:
-                                    _rpct = 0
-                                if _rpct >= 90:
-                                    logger.warning(f"Resurrect [{rname}]: RAM still {_rpct:.0f}% — skip")
-                                    return
-                                logger.info(f"Resurrect [{rname}]: RAM {_rpct:.0f}% OK — relaunching")
-                                await bot_instance._enqueue_start(rname, radmin)
-                            asyncio.create_task(_resurrect_clone(oldest_name, admin_id))
-                except Exception as e:
-                    logger.error(f"OOM check error: {e}", exc_info=True)
 
             await bot_instance.refresh_dashboard()
         except Exception as e:
