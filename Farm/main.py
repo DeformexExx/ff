@@ -252,19 +252,23 @@ async def _isolated_stop(suffix: str) -> None:
        (prevents collapsing other floating Roblox windows)
     2. am force-stop — kill the process
     3. rm cache/* + code_cache/* — free stored data
+    V12.4: All commands have 15s timeout to prevent watchdog hang.
     """
     pkg = f"com.roblox.clien{suffix}"
+    logger.info(f"_isolated_stop [{pkg}]: starting (stack remove → force-stop → cache clean)")
     # Step 1: detach floating window (ignore errors if no stack found)
     await run_bash(
         f'su -c "am stack remove $(su -c \\"dumpsys activity activities'
         f" | grep {pkg} | grep 'Stack #' | cut -d '#' -f 2 | cut -d ' '"
-        f' -f 1\\")" 2>/dev/null'
+        f' -f 1\\")" 2>/dev/null',
+        timeout=15,
     )
     # Step 2: force-stop the process
-    await run_bash(f"su -c 'am force-stop {pkg}'")
+    await run_bash(f"su -c 'am force-stop {pkg}'", timeout=15)
     # Step 3: cache clean
-    await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/*'")
-    await run_bash(f"su -c 'rm -rf /data/data/{pkg}/code_cache/*'")
+    await run_bash(f"su -c 'rm -rf /data/data/{pkg}/cache/*'", timeout=10)
+    await run_bash(f"su -c 'rm -rf /data/data/{pkg}/code_cache/*'", timeout=10)
+    logger.info(f"_isolated_stop [{pkg}]: done")
 
 
 async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
@@ -480,20 +484,28 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                                 cf.write(f"{'='*60}\n")
                         except Exception:
                             pass
+                        logger.critical(">>> UPTIME REBOOT: SYSRQ COMMAND EXECUTING <<<")
                         await run_bash(
-                            'su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"'
+                            'su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"',
+                            timeout=10,
                         )
+                        logger.critical(">>> UPTIME REBOOT: SYSRQ FAILED, TRYING su -c reboot <<<")
                         await asyncio.sleep(3)
-                        await run_bash("su -c 'reboot'")
+                        await run_bash("su -c 'reboot'", timeout=10)
+                        logger.critical(">>> UPTIME REBOOT: ALL REBOOT COMMANDS FAILED <<<")
+                        os._exit(1)
                 except Exception as e:
-                    logger.error(f"Uptime Reboot check error: {e}")
+                    logger.error(f"Uptime Reboot check error: {e}", exc_info=True)
 
             # ── OOM Protection: Two-level RAM guard via /proc/meminfo ─────
             #    Level 1 (<250MB): kill oldest Roblox clone to free RAM
             #    Level 2 (<150MB): emergency sync + reboot
+            #    V12.4: Direct file read (no shell fork under OOM)
             if ENABLE_AUTO_REBOOT:
                 try:
-                    _, _mi, _ = await run_bash("cat /proc/meminfo")
+                    # Direct read — no shell fork, works even under extreme OOM
+                    with open("/proc/meminfo", "r") as _mf:
+                        _mi = _mf.read()
                     def _parse_kb(key: str) -> int:
                         m = re.search(rf"{key}:\s+(\d+)", _mi)
                         return int(m.group(1)) if m else 0
@@ -501,12 +513,13 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                     if mem_avail_kb == 0:
                         mem_avail_kb = _parse_kb("MemFree") + _parse_kb("Buffers") + _parse_kb("Cached")
                     mem_avail_mb = mem_avail_kb / 1024.0
+                    logger.info(f"OOM Check: MemAvailable={mem_avail_mb:.0f}MB (L1={RAM_LEVEL1_MB}, L2={RAM_LEVEL2_MB})")
 
                     if mem_avail_mb < RAM_LEVEL2_MB:
                         # ── LEVEL 2: CRITICAL — emergency reboot ─────────
                         logger.critical(
                             f"!!! CRITICAL RAM: {mem_avail_mb:.0f}MB < {RAM_LEVEL2_MB}MB !!! "
-                            f"Emergency reboot…"
+                            f">>> EXECUTING REBOOT NOW <<<"
                         )
                         admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
                         if admin_id and application:
@@ -521,29 +534,36 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                                 pass
                         # Write crash_report.txt before reboot
                         try:
-                            _, _free_out, _ = await run_bash("free -m")
                             crash_path = os.path.join(FARM_DIR, "crash_report.txt")
                             with open(crash_path, "a", encoding="utf-8") as cf:
                                 cf.write(f"\n{'='*60}\n")
                                 cf.write(f"WATCHDOG LEVEL2 REBOOT @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                                 cf.write(f"MemAvailable: {mem_avail_mb:.0f}MB < {RAM_LEVEL2_MB}MB\n")
-                                cf.write(f"--- free -m ---\n{_free_out}\n{'='*60}\n")
+                                cf.write(f"--- /proc/meminfo ---\n{_mi[:500]}\n{'='*60}\n")
                         except Exception:
                             pass
-                        # Kernel-level sysrq reboot (works even if system frozen)
+                        # Kernel-level sysrq reboot — NO try/except, MUST execute
+                        logger.critical(">>> SYSRQ REBOOT COMMAND EXECUTING <<<")
                         await run_bash(
-                            'su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"'
+                            'su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"',
+                            timeout=10,
                         )
                         # Fallback if sysrq fails
+                        logger.critical(">>> SYSRQ FAILED, TRYING su -c reboot <<<")
                         await asyncio.sleep(3)
-                        await run_bash("su -c 'reboot'")
+                        await run_bash("su -c 'reboot'", timeout=10)
+                        # If both fail, force via os
+                        logger.critical(">>> REBOOT COMMANDS FAILED, TRYING os._exit <<<")
+                        os._exit(1)
 
                     elif mem_avail_mb < RAM_LEVEL1_MB:
                         # ── LEVEL 1: LOW — kill oldest running clone ─────
-                        # V12.4: Kill → Resurrect: kill oldest, wait 10s, relaunch
+                        # V12.4: Kill → Resurrect with cycle protection
                         oldest_name = None
                         oldest_ts = float("inf")
                         for cname, cstate in bot_instance.clone_states.items():
+                            if ":" in cname:
+                                continue
                             if cstate == CloneState.RUNNING:
                                 ts = bot_instance.running_since.get(cname, float("inf"))
                                 if ts < oldest_ts:
@@ -553,11 +573,10 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                             sfx = oldest_name[-1].lower() if oldest_name.lower().startswith("clien") else oldest_name.lower()
                             logger.warning(
                                 f"OOM Level 1: {mem_avail_mb:.0f}MB < {RAM_LEVEL1_MB}MB — "
-                                f"killing oldest clone [{oldest_name}] → will resurrect in 10s"
+                                f"killing oldest clone [{oldest_name}]"
                             )
                             await _isolated_stop(sfx)
                             bot_instance.set_state(oldest_name, CloneState.STOPPED)
-                            # V12.4: Do NOT disable clone — keep enabled for resurrect
                             admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
                             if admin_id and application:
                                 try:
@@ -569,10 +588,24 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                                     )
                                 except Exception:
                                     pass
-                            # V12.4: Kill → Resurrect — wait 10s then relaunch
+                            # V12.4: Kill → Resurrect with RAM re-check
                             async def _resurrect_clone(rname, radmin):
                                 await asyncio.sleep(10)
-                                logger.info(f"OOM Resurrect: relaunching [{rname}] after 10s cooldown")
+                                # Re-check RAM before resurrecting — prevent infinite cycle
+                                try:
+                                    with open("/proc/meminfo", "r") as _rf:
+                                        _rmi = _rf.read()
+                                    _rm = re.search(r"MemAvailable:\s+(\d+)", _rmi)
+                                    _ravail = int(_rm.group(1)) / 1024.0 if _rm else 9999
+                                except Exception:
+                                    _ravail = 9999
+                                if _ravail < RAM_LEVEL1_MB:
+                                    logger.warning(
+                                        f"OOM Resurrect [{rname}]: RAM still low ({_ravail:.0f}MB) "
+                                        f"— skipping relaunch to prevent cycle"
+                                    )
+                                    return
+                                logger.info(f"OOM Resurrect: relaunching [{rname}] (RAM={_ravail:.0f}MB OK)")
                                 await bot_instance._enqueue_start(rname, radmin)
                             asyncio.create_task(_resurrect_clone(oldest_name, admin_id))
                         else:
@@ -580,9 +613,9 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                                 f"OOM Level 1: {mem_avail_mb:.0f}MB < {RAM_LEVEL1_MB}MB — "
                                 f"no running clones to kill, syncing…"
                             )
-                            await run_bash("su -c 'sync'")
+                            await run_bash("su -c 'sync'", timeout=10)
                 except Exception as e:
-                    logger.error(f"OOM Protection check error: {e}")
+                    logger.error(f"OOM Protection check error: {e}", exc_info=True)
 
             await bot_instance.refresh_dashboard()
         except Exception as e:
