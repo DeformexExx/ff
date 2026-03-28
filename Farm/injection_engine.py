@@ -59,7 +59,12 @@ class InjectionEngine:
             await update_status(f"🚀 ({clone_name}) Запуск на сервер...")
             await run_bash(f"su -c 'am force-stop com.roblox.{clone_name}'")
             
-            launch_cmd = f"su -c \"am start -a android.intent.action.VIEW -d '{server_link}' com.roblox.{clone_name}\""
+            # V12.4: Detached Launch — nohup ensures Roblox survives Python crash
+            launch_cmd = (
+                f"su -c \"nohup am start -a android.intent.action.VIEW "
+                f"-d '{server_link}' com.roblox.{clone_name} "
+                f"> /dev/null 2>&1 &\""
+            )
             ret, _, stderr = await run_bash(launch_cmd)
             
             if ret == 0:

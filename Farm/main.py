@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Aegis bot — V12.3 FAILSAFE OOM + SYSRQ REBOOT
+# Aegis bot — V12.4 ZOMBIE FARM FIX (Kill→Resurrect, Heartbeat, Uptime Reboot, Detached Launch, Empty Farm Guard)
 import os
 import sys
 import enum
@@ -169,12 +169,15 @@ from injection_engine    import InjectionEngine
 from bash_utils          import run_bash
 from persistence_manager import PersistenceManager
 
-VERSION = "12.3"
+VERSION = "12.4"
 
-# ── V12.3 Configuration Constants ────────────────────────────────────────────
+# ── V12.4 Configuration Constants ────────────────────────────────────────────
 ENABLE_AUTO_REBOOT = True       # Enable two-level OOM protection in watchdog
 RAM_LEVEL1_MB      = 250        # Level 1: kill oldest Roblox clone to free RAM
 RAM_LEVEL2_MB      = 150        # Level 2: sysrq kernel reboot
+UPTIME_REBOOT_SEC  = 9000       # V12.4: 2.5 hours → forced sysrq reboot
+HEARTBEAT_SEC      = 30         # V12.4: heartbeat check interval (seconds)
+EMPTY_FARM_WAIT    = 120        # V12.4: seconds to wait before empty-farm guard triggers
 # SILENT_MODE is now persisted via PersistenceManager.silent_mode (toggle in System menu)
 
 logging.basicConfig(
@@ -266,7 +269,7 @@ async def _isolated_stop(suffix: str) -> None:
 
 async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
     """
-    V12.0 Intelligent Watchdog — Net-Pulse powered.
+    V12.4 Intelligent Watchdog — Net-Pulse powered + Zombie Farm Fix.
     Runs every 15s. Only acts on clones with enabled=True in session_state.
 
     Stage 1 — Liveness:   cached PID check via /proc/{pid} → Hard Reset if gone
@@ -275,7 +278,10 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
     Stage 3 — Threads:    Deep thread check (ls /proc/PID/task).
               If TH==0 but CON>0 → ignore TH (Net-Pulse rule).
               If TH==0 and CON==0 → phantom kill.
-    RAM Guard: free RAM < 1.0 GB → sync (no drop_caches)
+    V12.4 — Heartbeat:    Every 30s check ALL enabled clones alive via pgrep
+    V12.4 — Uptime Reboot: /proc/uptime > 2.5h → sysrq reboot
+    V12.4 — Empty Farm Guard: 0 running among enabled → mass restart
+    V12.4 — Kill→Resurrect: OOM Level 1 kill → wait 10s → relaunch
     """
     GRACE_SEC    = 120    # startup grace before checking
     TCP_ACTIVE   = 8      # ≥8 → ACTIVE
@@ -285,6 +291,10 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
 
     # Per-clone zombie timer: {name: timestamp when conns first dropped to ZOMBIE}
     tcp_low_since: Dict[str, float] = {}
+    # V12.4: Heartbeat timer
+    last_heartbeat: float = time.time()
+    # V12.4: Empty farm guard — timestamp when farm first seen empty
+    empty_farm_since: Optional[float] = None
 
     while True:
         await asyncio.sleep(POLL_SEC)
@@ -366,6 +376,118 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                     )
                     continue
 
+            # ── V12.4 Heartbeat: check ALL enabled clones alive every 30s ─
+            if now - last_heartbeat >= HEARTBEAT_SEC:
+                last_heartbeat = now
+                admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                enabled_clones = bot_instance.persistence.get_enabled_clones()
+                for hb_name in enabled_clones:
+                    hb_state = bot_instance.clone_states.get(hb_name)
+                    # Skip clones that are currently starting
+                    if hb_state == CloneState.STARTING:
+                        continue
+                    hb_suffix = hb_name[-1].lower() if hb_name.lower().startswith("clien") else hb_name.lower()
+                    hb_alive = await clone_pgrep_alive(hb_suffix)
+                    if not hb_alive and hb_state != CloneState.STARTING:
+                        logger.warning(f"Heartbeat [{hb_name}]: dead (pgrep) — relaunching")
+                        bot_instance.set_state(hb_name, CloneState.STOPPED)
+                        bot_instance.pid_cache.pop(hb_name, None)
+                        if admin_id and application and not bot_instance.persistence.silent_mode:
+                            try:
+                                await application.bot.send_message(
+                                    admin_id,
+                                    f"💓 Heartbeat: <code>{html.escape(hb_name.replace('_','-'))}</code> "
+                                    f"мёртв → перезапуск",
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                pass
+                        asyncio.create_task(bot_instance._enqueue_start(hb_name, admin_id))
+                        await asyncio.sleep(5)  # small gap between heartbeat relaunches
+
+            # ── V12.4 Empty Farm Guard ────────────────────────────────────
+            enabled_clones = bot_instance.persistence.get_enabled_clones()
+            if enabled_clones:
+                running_count = sum(
+                    1 for en in enabled_clones
+                    if bot_instance.clone_states.get(en) == CloneState.RUNNING
+                )
+                starting_count = sum(
+                    1 for en in enabled_clones
+                    if bot_instance.clone_states.get(en) == CloneState.STARTING
+                )
+                if running_count == 0 and starting_count == 0:
+                    if empty_farm_since is None:
+                        empty_farm_since = now
+                        logger.warning(f"Empty Farm Guard: 0 running among {len(enabled_clones)} enabled — timer started")
+                    elif now - empty_farm_since >= EMPTY_FARM_WAIT:
+                        empty_farm_since = None
+                        logger.warning(
+                            f"Empty Farm Guard: 0 running for {EMPTY_FARM_WAIT}s — "
+                            f"triggering mass restart of {len(enabled_clones)} enabled clones"
+                        )
+                        admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                        if admin_id and application:
+                            try:
+                                await application.bot.send_message(
+                                    admin_id,
+                                    f"🚨 <b>Empty Farm Guard</b>: 0 клонов работает из "
+                                    f"{len(enabled_clones)} включённых → массовый перезапуск",
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                pass
+                        # Relaunch all enabled clones with stagger
+                        for efg_name in enabled_clones:
+                            if bot_instance.abort_launch:
+                                break
+                            asyncio.create_task(bot_instance._enqueue_start(efg_name, admin_id))
+                            await asyncio.sleep(10)
+                else:
+                    empty_farm_since = None  # reset — farm is alive
+
+            # ── V12.4 Uptime Reboot: /proc/uptime > 2.5h → sysrq reboot ─
+            if ENABLE_AUTO_REBOOT and UPTIME_REBOOT_SEC > 0:
+                try:
+                    with open("/proc/uptime", "r") as _uf:
+                        _uptime_str = _uf.read().split()[0]
+                    device_uptime = float(_uptime_str)
+                    if device_uptime >= UPTIME_REBOOT_SEC:
+                        logger.warning(
+                            f"Uptime Reboot: device up {device_uptime:.0f}s "
+                            f"(>{UPTIME_REBOOT_SEC}s / {UPTIME_REBOOT_SEC/3600:.1f}h) → sysrq reboot"
+                        )
+                        admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                        if admin_id and application:
+                            try:
+                                await application.bot.send_message(
+                                    admin_id,
+                                    f"🔄 <b>Uptime Reboot</b>: устройство работает "
+                                    f"{device_uptime/3600:.1f}ч (лимит {UPTIME_REBOOT_SEC/3600:.1f}ч) "
+                                    f"— перезагрузка",
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                pass
+                        # Write crash_report before reboot
+                        try:
+                            crash_path = os.path.join(FARM_DIR, "crash_report.txt")
+                            with open(crash_path, "a", encoding="utf-8") as cf:
+                                cf.write(f"\n{'='*60}\n")
+                                cf.write(f"UPTIME REBOOT @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                cf.write(f"Device uptime: {device_uptime:.0f}s ({device_uptime/3600:.1f}h)\n")
+                                cf.write(f"Threshold: {UPTIME_REBOOT_SEC}s ({UPTIME_REBOOT_SEC/3600:.1f}h)\n")
+                                cf.write(f"{'='*60}\n")
+                        except Exception:
+                            pass
+                        await run_bash(
+                            'su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"'
+                        )
+                        await asyncio.sleep(3)
+                        await run_bash("su -c 'reboot'")
+                except Exception as e:
+                    logger.error(f"Uptime Reboot check error: {e}")
+
             # ── OOM Protection: Two-level RAM guard via /proc/meminfo ─────
             #    Level 1 (<250MB): kill oldest Roblox clone to free RAM
             #    Level 2 (<150MB): emergency sync + reboot
@@ -418,7 +540,7 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
 
                     elif mem_avail_mb < RAM_LEVEL1_MB:
                         # ── LEVEL 1: LOW — kill oldest running clone ─────
-                        # Find the clone that has been running the longest
+                        # V12.4: Kill → Resurrect: kill oldest, wait 10s, relaunch
                         oldest_name = None
                         oldest_ts = float("inf")
                         for cname, cstate in bot_instance.clone_states.items():
@@ -431,22 +553,28 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                             sfx = oldest_name[-1].lower() if oldest_name.lower().startswith("clien") else oldest_name.lower()
                             logger.warning(
                                 f"OOM Level 1: {mem_avail_mb:.0f}MB < {RAM_LEVEL1_MB}MB — "
-                                f"killing oldest clone [{oldest_name}]"
+                                f"killing oldest clone [{oldest_name}] → will resurrect in 10s"
                             )
                             await _isolated_stop(sfx)
                             bot_instance.set_state(oldest_name, CloneState.STOPPED)
-                            bot_instance.persistence.set_clone_enabled(oldest_name, False)
+                            # V12.4: Do NOT disable clone — keep enabled for resurrect
                             admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
                             if admin_id and application:
                                 try:
                                     await application.bot.send_message(
                                         admin_id,
                                         f"⚠️ <b>OOM Level 1: {mem_avail_mb:.0f}MB free</b>\n"
-                                        f"Killed oldest clone: <code>{html.escape(oldest_name)}</code>",
+                                        f"Killed: <code>{html.escape(oldest_name)}</code> → resurrect in 10s",
                                         parse_mode="HTML",
                                     )
                                 except Exception:
                                     pass
+                            # V12.4: Kill → Resurrect — wait 10s then relaunch
+                            async def _resurrect_clone(rname, radmin):
+                                await asyncio.sleep(10)
+                                logger.info(f"OOM Resurrect: relaunching [{rname}] after 10s cooldown")
+                                await bot_instance._enqueue_start(rname, radmin)
+                            asyncio.create_task(_resurrect_clone(oldest_name, admin_id))
                         else:
                             logger.warning(
                                 f"OOM Level 1: {mem_avail_mb:.0f}MB < {RAM_LEVEL1_MB}MB — "
@@ -1138,7 +1266,7 @@ class AegisBot:
         try:
             m = await app.bot.send_message(
                 chat_id,
-                f"🚀 Staggered Start V12.2 — {len(clones)} клонов (пауза {STAGGER_SEC}с + RAM check)…",
+                f"🚀 Staggered Start V12.4 — {len(clones)} клонов (пауза {STAGGER_SEC}с + RAM check)…",
                 parse_mode="HTML",
             )
 
