@@ -115,7 +115,6 @@ class UIManager:
                 [InlineKeyboardButton(f"Консоль: {c}", callback_data="toggle_console")],
                 [InlineKeyboardButton(f"AutoResume: {r}", callback_data="toggle_restore")],
                 [InlineKeyboardButton(f"Silent Mode: {s}", callback_data="toggle_silent")],
-                [InlineKeyboardButton("🔑 Global HWID Reset", callback_data="hwid_global_reset")],
                 [InlineKeyboardButton("⬅️ В меню", callback_data="nav_home")],
             ]
         )
@@ -234,22 +233,7 @@ class UIManager:
                 ],
                 [
                     InlineKeyboardButton("🧹 ОЧИСТКА", callback_data=f"purge_cache_{name}"),
-                    InlineKeyboardButton("🔑 Reset HWID", callback_data=f"hwid_reset_{name}"),
-                ],
-                [
                     InlineKeyboardButton("⬅️ НАЗАД", callback_data="hub_clones"),
-                ],
-            ]
-        )
-
-    @staticmethod
-    def get_hwid_confirm_keyboard(scope: str = "global") -> InlineKeyboardMarkup:
-        """Confirmation dialog for Global HWID Reset."""
-        return InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("✅ Да, сбросить ВСЁ", callback_data=f"hwid_confirm_{scope}"),
-                    InlineKeyboardButton("❌ Отмена", callback_data="nav_home"),
                 ],
             ]
         )
