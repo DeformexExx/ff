@@ -184,7 +184,7 @@ VERSION = "12.4"
 ENABLE_AUTO_REBOOT = True       # Enable OOM protection + uptime reboot in watchdog
 # RAM_REBOOT_PERCENT = 98 — defined above (failsafe process uses it too)
 # RAM_WATCHDOG_POLL  = 10 — defined above
-UPTIME_REBOOT_SEC  = 5400       # V12.4: 1.5 hours → forced reboot (ugPhone cache cleanup)
+UPTIME_REBOOT_SEC  = 3600       # V12.4: 1.5 hours → forced reboot (ugPhone cache cleanup)
 HEARTBEAT_SEC      = 30         # V12.4: heartbeat check interval (seconds)
 EMPTY_FARM_WAIT    = 120        # V12.4: seconds to wait before empty-farm guard triggers
 # SILENT_MODE is now persisted via PersistenceManager.silent_mode (toggle in System menu)
