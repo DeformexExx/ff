@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-# config_manager.py — Aegis V11.0
+# config_manager.py — Aegis V12.2 (HWID support)
 import json
 import os
 import logging
+
+from hwid_manager import ensure_fingerprint
 
 logger = logging.getLogger("ConfigManager")
 
@@ -42,6 +44,14 @@ class ConfigManager:
                 with open(self._dev_path, "r", encoding="utf-8") as f:
                     self._raw_dev = json.load(f)
                 self.clones_data = self._raw_dev.get("clones", [])
+                # V12.2: Auto-generate HWID fingerprints for clones missing them
+                hwid_changed = False
+                for clone in self.clones_data:
+                    if ensure_fingerprint(clone):
+                        hwid_changed = True
+                if hwid_changed:
+                    self._save_dev()
+                    logger.info("HWID: auto-generated missing fingerprints, saved to DEV json.")
             except Exception as e:
                 logger.error(f"DEV json load error: {e}")
         else:

@@ -4,12 +4,30 @@ import time
 import json
 import os
 from bash_utils import run_bash
+from hwid_manager import apply_fingerprint
 
 logger = logging.getLogger("InjectionEngine")
 
+
 class InjectionEngine:
     @staticmethod
-    async def inject_and_launch(clone_name: str, cookie: str, place_id: str = None, link_code: str = None, status_msg=None) -> bool:
+    async def inject_and_launch(
+        clone_name: str,
+        cookie: str,
+        place_id: str = None,
+        link_code: str = None,
+        status_msg=None,
+        android_id: str = None,
+        device_model: str = None,
+        manufacturer: str = None,
+    ) -> bool:
+        """
+        V12.2: Full launch sequence with HWID fingerprint.
+        1. Apply android_id via settings put --user 0 — abort on failure
+        2. Cookie injection via SQLite
+        3. Restore permissions
+        4. am start with server link
+        """
         async def update_status(text: str):
             logger.info(text)
             if status_msg:
@@ -19,22 +37,43 @@ class InjectionEngine:
                     pass
 
         try:
+            # ── V12.2: Apply HWID fingerprint BEFORE launch ──────────────
+            if android_id:
+                await update_status(f"🔐 ({clone_name}) Applying HWID identity…")
+                hwid_ok, hwid_err = await apply_fingerprint(
+                    clone_name, android_id,
+                    device_model or "", manufacturer or "",
+                )
+                if not hwid_ok:
+                    await update_status(
+                        f"❌ ({clone_name}) HWID FAILED — launch aborted!\n{hwid_err}"
+                    )
+                    return False
+                await update_status(
+                    f"🔐 [{clone_name}] Identity: Android ID [{android_id}] Applied "
+                    f"(Model Spoofing: Disabled by System)"
+                )
+            else:
+                logger.warning(f"({clone_name}) No android_id — launching without fingerprint")
+
+            # ── Server link ───────────────────────────────────────────────
             server_link = None
             if os.path.exists("server.json"):
                 with open("server.json", "r") as f:
                     data = json.load(f)
                     if isinstance(data, list) and len(data) > 0:
                         server_link = data[0]
-            
+
             if not server_link:
                 await update_status(f"❌ Ссылка на сервер не найдена в server.json")
                 return False
 
+            # ── Cookie injection ──────────────────────────────────────────
             await update_status(f"⏳ ({clone_name}) Инъекция Cookie...")
             sqlite_bin = "/data/data/com.termux/files/usr/bin/sqlite3"
             db_path = f"/data/data/com.roblox.{clone_name}/app_webview/Default/Cookies"
             current_time = int(time.time() * 1000000)
-            
+
             cookie_sql = cookie.replace("'", "''")
             sql_del = "DELETE FROM cookies;"
             sql_ins = (
@@ -43,25 +82,27 @@ class InjectionEngine:
                 f"VALUES ({current_time}, '.roblox.com', '', '.ROBLOSECURITY', '{cookie_sql}', '/', 253402300799000000, 1, 1, "
                 f"{current_time}, 1, 1, -1, -1);"
             )
-            
+
             await run_bash(f"su -c 'rm -f {db_path}-journal {db_path}-wal'")
-            
+
             inj_cmd = f"su -c \"{sqlite_bin} {db_path} \\\"{sql_del} {sql_ins}\\\"\""
             ret, _, stderr = await run_bash(inj_cmd)
             if ret != 0:
                 await update_status(f"❌ SQLite Ошибка: {stderr}")
                 return False
 
+            # ── Restore permissions ───────────────────────────────────────
             await update_status(f"⏳ ({clone_name}) Восстановление прав...")
             chown_cmd = f"su -c \"chown \\$(stat -c %u:%g /data/data/com.roblox.{clone_name}) {db_path}\""
             await run_bash(chown_cmd)
 
+            # ── Launch ────────────────────────────────────────────────────
             await update_status(f"🚀 ({clone_name}) Запуск на сервер...")
             await run_bash(f"su -c 'am force-stop com.roblox.{clone_name}'")
-            
+
             launch_cmd = f"su -c \"am start -a android.intent.action.VIEW -d '{server_link}' com.roblox.{clone_name}\""
             ret, _, stderr = await run_bash(launch_cmd)
-            
+
             if ret == 0:
                 await update_status(f"✅ Запущено ({clone_name})")
                 return True

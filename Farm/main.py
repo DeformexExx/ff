@@ -74,6 +74,7 @@ from monitor             import MonitorEngine, clone_pgrep_alive
 from injection_engine    import InjectionEngine
 from bash_utils          import run_bash
 from persistence_manager import PersistenceManager
+from hwid_manager        import reset_fingerprint, ensure_fingerprint
 
 VERSION = "12.2"
 
@@ -722,6 +723,27 @@ class AegisBot:
             elif d == "sys_screenshot": await self._take_screenshot(q.message)
             elif d == "sys_help": await q.message.reply_text(UIManager.get_help_text(), parse_mode="HTML")
 
+            # ── V12.2 HWID: Global Reset (confirmation dialog) ───────────
+            elif d == "hwid_global_reset":
+                await q.message.reply_text(
+                    "⚠️ <b>Сбросить HWID для ВСЕХ аккаунтов?</b>\n"
+                    "Новые android_id и модели будут сгенерированы.",
+                    reply_markup=UIManager.get_hwid_confirm_keyboard("global"),
+                    parse_mode="HTML",
+                )
+
+            elif d == "hwid_confirm_global":
+                count = 0
+                for clone in self.config.clones_data:
+                    reset_fingerprint(clone)
+                    count += 1
+                self.config._save_dev()
+                self.config.reload()
+                await q.message.reply_text(
+                    f"✅ HWID сброшен для {count} аккаунтов.",
+                    parse_mode="HTML",
+                )
+
             elif d == "deep_clean":
                 await context.bot.send_message(chat, "🧹 Deep clean (sync)…", parse_mode="HTML")
                 await self._do_deep_clean()
@@ -771,6 +793,23 @@ class AegisBot:
             elif d.startswith("purge_cache_"):
                 name = d[12:]
                 await self._purge_clone_cache(name, chat)
+
+            # ── V12.2 HWID: Reset for single clone ───────────────────────
+            elif d.startswith("hwid_reset_"):
+                name = d[11:]
+                ci = self.config.get_clone(name)
+                if ci:
+                    fp = reset_fingerprint(ci)
+                    self.config._save_dev()
+                    await context.bot.send_message(
+                        chat,
+                        f"🔑 HWID сброшен для <code>{html.escape(name)}</code>\n"
+                        f"ID: <code>{fp['android_id']}</code>\n"
+                        f"Model: {fp['device_model']} ({fp['manufacturer']})",
+                        parse_mode="HTML",
+                    )
+                else:
+                    await context.bot.send_message(chat, f"❌ Клон {name} не найден.")
 
             elif d.startswith("start_"):
                 name = d[6:]
@@ -872,8 +911,13 @@ class AegisBot:
             except Exception as e:
                 logger.error(f"server config read error: {e}")
 
+            # V12.2: Pass HWID fingerprint data to injection engine
             ok = await InjectionEngine.inject_and_launch(
-                name, ci.get("cookie"), p_id, l_code, sm)
+                name, ci.get("cookie"), p_id, l_code, sm,
+                android_id=ci.get("android_id"),
+                device_model=ci.get("device_model"),
+                manufacturer=ci.get("manufacturer"),
+            )
 
             if ok:
                 self.set_state(name, CloneState.RUNNING)
