@@ -78,8 +78,9 @@ from persistence_manager import PersistenceManager
 VERSION = "12.2"
 
 # ── V12.2 Configuration Constants ────────────────────────────────────────────
-ENABLE_AUTO_REBOOT = True       # Auto-reboot device when RAM >= 98%
-REBOOT_AT_PERCENT  = 98         # RAM usage % threshold for emergency reboot
+ENABLE_AUTO_REBOOT = True       # Enable two-level OOM protection
+RAM_LEVEL1_MB      = 250        # Level 1: kill oldest Roblox clone to free RAM
+RAM_LEVEL2_MB      = 150        # Level 2: emergency reboot (su -c "reboot")
 # SILENT_MODE is now persisted via PersistenceManager.silent_mode (toggle in System menu)
 
 logging.basicConfig(
@@ -187,7 +188,6 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
     TCP_ZOMBIE   = 5      # ≤5 → ZOMBIE
     ZOMBIE_SEC   = 30     # V12.0: 30s sustained ZOMBIE → Hard Reset
     POLL_SEC     = 15     # V12.0: poll every 15s
-    RAM_LOW_GB   = 1.0    # V12.0: lower threshold for 15GB devices
 
     # Per-clone zombie timer: {name: timestamp when conns first dropped to ZOMBIE}
     tcp_low_since: Dict[str, float] = {}
@@ -272,55 +272,78 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                     )
                     continue
 
-            # ── RAM Guard: sync if free RAM < threshold (no drop_caches) ──
-            try:
-                ram_str = await MonitorEngine.get_ram_free_gb()
-                m_ram = re.search(r"([\d.]+)\s*GB", ram_str)
-                if m_ram and float(m_ram.group(1)) < RAM_LOW_GB:
-                    logger.warning(f"Watchdog: RAM {ram_str} < {RAM_LOW_GB}GB → sync")
-                    await run_bash("su -c 'sync'")
-            except Exception:
-                pass
-
-            # ── V12.2 RAM-Killer: emergency reboot at 98% usage ──────────
-            #    Uses: cat /proc/meminfo
-            #    Formula: Used% = (MemTotal - MemAvailable) / MemTotal * 100
-            #    Fallback if no MemAvailable: Total - (Free + Buffers + Cached)
-            #    Threshold: > 98% → su -c 'sync && reboot'
+            # ── OOM Protection: Two-level RAM guard via /proc/meminfo ─────
+            #    Level 1 (<250MB): kill oldest Roblox clone to free RAM
+            #    Level 2 (<150MB): emergency sync + reboot
             if ENABLE_AUTO_REBOOT:
                 try:
                     _, _mi, _ = await run_bash("cat /proc/meminfo")
                     def _parse_kb(key: str) -> int:
                         m = re.search(rf"{key}:\s+(\d+)", _mi)
                         return int(m.group(1)) if m else 0
-                    mem_total = _parse_kb("MemTotal")
-                    mem_avail = _parse_kb("MemAvailable")
-                    if mem_avail == 0:
-                        # Fallback: Total - (Free + Buffers + Cached)
-                        mem_avail = _parse_kb("MemFree") + _parse_kb("Buffers") + _parse_kb("Cached")
-                    if mem_total > 0:
-                        ram_percent = ((mem_total - mem_avail) / mem_total) * 100
-                        if ram_percent > REBOOT_AT_PERCENT:
-                            used_mb = (mem_total - mem_avail) // 1024
-                            total_mb = mem_total // 1024
-                            logger.critical(
-                                f"!!! CRITICAL RAM: {ram_percent:.1f}% > {REBOOT_AT_PERCENT}% "
-                                f"({used_mb}/{total_mb}MB) !!! Rebooting…"
+                    mem_avail_kb = _parse_kb("MemAvailable")
+                    if mem_avail_kb == 0:
+                        mem_avail_kb = _parse_kb("MemFree") + _parse_kb("Buffers") + _parse_kb("Cached")
+                    mem_avail_mb = mem_avail_kb / 1024.0
+
+                    if mem_avail_mb < RAM_LEVEL2_MB:
+                        # ── LEVEL 2: CRITICAL — emergency reboot ─────────
+                        logger.critical(
+                            f"!!! CRITICAL RAM: {mem_avail_mb:.0f}MB < {RAM_LEVEL2_MB}MB !!! "
+                            f"Emergency reboot…"
+                        )
+                        admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                        if admin_id and application:
+                            try:
+                                await application.bot.send_message(
+                                    admin_id,
+                                    f"🔴 <b>CRITICAL RAM {mem_avail_mb:.0f}MB</b> "
+                                    f"< {RAM_LEVEL2_MB}MB — rebooting device!",
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                pass
+                        await run_bash("su -c 'sync && reboot'")
+
+                    elif mem_avail_mb < RAM_LEVEL1_MB:
+                        # ── LEVEL 1: LOW — kill oldest running clone ─────
+                        # Find the clone that has been running the longest
+                        oldest_name = None
+                        oldest_ts = float("inf")
+                        for cname, cstate in bot_instance.clone_states.items():
+                            if cstate == CloneState.RUNNING:
+                                ts = bot_instance.running_since.get(cname, float("inf"))
+                                if ts < oldest_ts:
+                                    oldest_ts = ts
+                                    oldest_name = cname
+                        if oldest_name:
+                            sfx = oldest_name[-1].lower() if oldest_name.lower().startswith("clien") else oldest_name.lower()
+                            logger.warning(
+                                f"OOM Level 1: {mem_avail_mb:.0f}MB < {RAM_LEVEL1_MB}MB — "
+                                f"killing oldest clone [{oldest_name}]"
                             )
+                            await _isolated_stop(sfx)
+                            bot_instance.set_state(oldest_name, CloneState.STOPPED)
+                            bot_instance.persistence.set_clone_enabled(oldest_name, False)
                             admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
                             if admin_id and application:
                                 try:
                                     await application.bot.send_message(
                                         admin_id,
-                                        f"🔴 <b>CRITICAL RAM {ram_percent:.1f}%</b> "
-                                        f"({used_mb}/{total_mb}MB) — rebooting device!",
+                                        f"⚠️ <b>OOM Level 1: {mem_avail_mb:.0f}MB free</b>\n"
+                                        f"Killed oldest clone: <code>{html.escape(oldest_name)}</code>",
                                         parse_mode="HTML",
                                     )
                                 except Exception:
                                     pass
-                            await run_bash("su -c 'sync && reboot'")
+                        else:
+                            logger.warning(
+                                f"OOM Level 1: {mem_avail_mb:.0f}MB < {RAM_LEVEL1_MB}MB — "
+                                f"no running clones to kill, syncing…"
+                            )
+                            await run_bash("su -c 'sync'")
                 except Exception as e:
-                    logger.error(f"RAM-Killer check error: {e}")
+                    logger.error(f"OOM Protection check error: {e}")
 
             await bot_instance.refresh_dashboard()
         except Exception as e:
