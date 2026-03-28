@@ -71,79 +71,88 @@ if not HAS_ROOT:
     print("❌ ROOT NOT AVAILABLE! su -c 'id' failed. Bot will NOT launch Roblox.")
 
 
-# ── V12.3 FAILSAFE RAM WATCHDOG (multiprocessing.Process) ────────────────────
-#    Runs as a SEPARATE PROCESS with os.nice(-20).
-#    Polls /proc/meminfo every 5 seconds.
-#    If MemAvailable < 100MB:
-#      1. Write crash_report.txt with free -m snapshot
-#      2. Kernel-level sysrq reboot (works even when system is frozen)
-RAM_FAILSAFE_MB = 100  # hard reboot threshold
-RAM_FAILSAFE_POLL = 5  # poll interval in seconds
+# ── V12.4 FAILSAFE RAM WATCHDOG (multiprocessing.Process) ────────────────────
+#    Runs as a SEPARATE PROCESS — independent of main bot.
+#    Polls /proc/meminfo every 10 seconds.
+#    Trigger: (MemTotal - MemAvailable) / MemTotal * 100 >= 98%
+#    Action: IMMEDIATE reboot via os.system('su -c "reboot"')
+#    NO clone killing, NO async, NO wrappers — straight to reboot.
+RAM_REBOOT_PERCENT = 98   # reboot when RAM usage >= 98%
+RAM_WATCHDOG_POLL  = 10   # poll every 10 seconds
 
 def _ram_failsafe_loop(farm_dir: str) -> None:
-    """Independent process: monitors RAM and reboots via sysrq if critical."""
-    # Set max priority for this watchdog process
+    """Independent process: monitors RAM % and reboots IMMEDIATELY at 98%+.
+    Uses os.system() — the simplest, most reliable reboot method.
+    No clone killing, no cleanup — straight to reboot at 98%."""
+    # Max priority + OOM protection
     try:
         os.nice(-20)
     except Exception:
         pass
-    # OOM protection for this process too
     pid = os.getpid()
     try:
-        subprocess.run(
-            ["su", "-c", f"echo -17 > /proc/{pid}/oom_adj"],
-            capture_output=True, timeout=10,
-        )
+        with open(f"/proc/{pid}/oom_adj", "w") as f:
+            f.write("-17")
+    except Exception:
+        pass
+    try:
+        with open(f"/proc/{pid}/oom_score_adj", "w") as f:
+            f.write("-1000")
     except Exception:
         pass
 
     while True:
+        time.sleep(RAM_WATCHDOG_POLL)
         try:
-            time.sleep(RAM_FAILSAFE_POLL)
             with open("/proc/meminfo", "r") as f:
                 mi = f.read()
-            # Parse MemAvailable (or fallback)
+            # Parse MemTotal and MemAvailable
             def _kb(key):
                 m = re.search(rf"{key}:\s+(\d+)", mi)
                 return int(m.group(1)) if m else 0
+            total_kb = _kb("MemTotal")
             avail_kb = _kb("MemAvailable")
             if avail_kb == 0:
                 avail_kb = _kb("MemFree") + _kb("Buffers") + _kb("Cached")
-            avail_mb = avail_kb / 1024.0
 
-            if avail_mb < RAM_FAILSAFE_MB:
-                # ── CRASH REPORT: snapshot free -m before reboot ──────────
-                crash_path = os.path.join(farm_dir, "crash_report.txt")
+            if total_kb <= 0:
+                continue  # can't calculate — skip this cycle
+
+            usage_pct = (total_kb - avail_kb) / total_kb * 100.0
+            avail_mb = avail_kb / 1024.0
+            total_mb = total_kb / 1024.0
+
+            if usage_pct >= RAM_REBOOT_PERCENT:
+                # ── LOG: visible in console ──────────────────────────────
+                msg = (
+                    f"[WATCHDOG] Memory at {usage_pct:.1f}% "
+                    f"({avail_mb:.0f}MB free / {total_mb:.0f}MB total). "
+                    f"Initiating SYSTEM REBOOT..."
+                )
+                print(msg, flush=True)
+
+                # ── CRASH REPORT ─────────────────────────────────────────
                 try:
-                    r = subprocess.run(
-                        ["free", "-m"], capture_output=True, text=True, timeout=5,
-                    )
-                    snapshot = r.stdout if r.returncode == 0 else "free -m failed"
-                except Exception as e:
-                    snapshot = f"free -m error: {e}"
-                try:
+                    crash_path = os.path.join(farm_dir, "crash_report.txt")
                     with open(crash_path, "a", encoding="utf-8") as cf:
                         cf.write(f"\n{'='*60}\n")
                         cf.write(f"FAILSAFE REBOOT @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                        cf.write(f"MemAvailable: {avail_mb:.0f}MB (threshold: {RAM_FAILSAFE_MB}MB)\n")
-                        cf.write(f"--- free -m ---\n{snapshot}\n")
-                        cf.write(f"--- /proc/meminfo (excerpt) ---\n")
-                        for line in mi.splitlines()[:10]:
-                            cf.write(f"  {line}\n")
+                        cf.write(f"RAM Usage: {usage_pct:.1f}% (threshold: {RAM_REBOOT_PERCENT}%)\n")
+                        cf.write(f"MemAvailable: {avail_mb:.0f}MB / MemTotal: {total_mb:.0f}MB\n")
                         cf.write(f"{'='*60}\n")
                 except Exception:
                     pass
 
-                # ── SYSRQ REBOOT: kernel-level instant reboot ────────────
-                # This works even when the system is completely frozen
-                subprocess.run(
-                    ["su", "-c",
-                     "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"],
-                    timeout=10,
-                )
-                # Fallback if sysrq fails
-                time.sleep(3)
-                subprocess.run(["su", "-c", "reboot"], timeout=10)
+                # ── REBOOT: direct os.system — no wrappers, no async ────
+                print("[WATCHDOG] >>> EXECUTING: su -c reboot <<<", flush=True)
+                os.system('su -c "reboot"')
+                # If os.system returns (shouldn't), try sysrq
+                time.sleep(5)
+                print("[WATCHDOG] >>> reboot failed, trying sysrq <<<", flush=True)
+                os.system('su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"')
+                # Last resort
+                time.sleep(5)
+                os._exit(1)
         except Exception:
             pass  # Never crash — keep watching
 
@@ -172,9 +181,9 @@ from persistence_manager import PersistenceManager
 VERSION = "12.4"
 
 # ── V12.4 Configuration Constants ────────────────────────────────────────────
-ENABLE_AUTO_REBOOT = True       # Enable two-level OOM protection in watchdog
-RAM_LEVEL1_MB      = 250        # Level 1: kill oldest Roblox clone to free RAM
-RAM_LEVEL2_MB      = 150        # Level 2: sysrq kernel reboot
+ENABLE_AUTO_REBOOT = True       # Enable OOM protection + uptime reboot in watchdog
+# RAM_REBOOT_PERCENT = 98 — defined above (failsafe process uses it too)
+# RAM_WATCHDOG_POLL  = 10 — defined above
 UPTIME_REBOOT_SEC  = 9000       # V12.4: 2.5 hours → forced sysrq reboot
 HEARTBEAT_SEC      = 30         # V12.4: heartbeat check interval (seconds)
 EMPTY_FARM_WAIT    = 120        # V12.4: seconds to wait before empty-farm guard triggers
@@ -497,68 +506,76 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                 except Exception as e:
                     logger.error(f"Uptime Reboot check error: {e}", exc_info=True)
 
-            # ── OOM Protection: Two-level RAM guard via /proc/meminfo ─────
-            #    Level 1 (<250MB): kill oldest Roblox clone to free RAM
-            #    Level 2 (<150MB): emergency sync + reboot
-            #    V12.4: Direct file read (no shell fork under OOM)
+            # ── OOM Protection: percentage-based RAM guard ────────────────
+            #    >= 98%: IMMEDIATE reboot via os.system (no clone killing)
+            #    >= 90%: kill oldest clone + resurrect after 10s
+            #    V12.4: Direct /proc/meminfo read, os.system for reboot
             if ENABLE_AUTO_REBOOT:
                 try:
-                    # Direct read — no shell fork, works even under extreme OOM
                     with open("/proc/meminfo", "r") as _mf:
                         _mi = _mf.read()
                     def _parse_kb(key: str) -> int:
                         m = re.search(rf"{key}:\s+(\d+)", _mi)
                         return int(m.group(1)) if m else 0
-                    mem_avail_kb = _parse_kb("MemAvailable")
-                    if mem_avail_kb == 0:
-                        mem_avail_kb = _parse_kb("MemFree") + _parse_kb("Buffers") + _parse_kb("Cached")
-                    mem_avail_mb = mem_avail_kb / 1024.0
-                    logger.info(f"OOM Check: MemAvailable={mem_avail_mb:.0f}MB (L1={RAM_LEVEL1_MB}, L2={RAM_LEVEL2_MB})")
+                    _total_kb = _parse_kb("MemTotal")
+                    _avail_kb = _parse_kb("MemAvailable")
+                    if _avail_kb == 0:
+                        _avail_kb = _parse_kb("MemFree") + _parse_kb("Buffers") + _parse_kb("Cached")
+                    if _total_kb > 0:
+                        _usage_pct = (_total_kb - _avail_kb) / _total_kb * 100.0
+                        _avail_mb = _avail_kb / 1024.0
+                        _total_mb = _total_kb / 1024.0
+                    else:
+                        _usage_pct = 0.0
+                        _avail_mb = 9999.0
+                        _total_mb = 0.0
 
-                    if mem_avail_mb < RAM_LEVEL2_MB:
-                        # ── LEVEL 2: CRITICAL — emergency reboot ─────────
+                    if _usage_pct >= RAM_REBOOT_PERCENT:
+                        # ── 98%+ : IMMEDIATE REBOOT — no clone killing ───
                         logger.critical(
-                            f"!!! CRITICAL RAM: {mem_avail_mb:.0f}MB < {RAM_LEVEL2_MB}MB !!! "
-                            f">>> EXECUTING REBOOT NOW <<<"
+                            f"[WATCHDOG] Memory at {_usage_pct:.1f}% "
+                            f"({_avail_mb:.0f}MB free / {_total_mb:.0f}MB total). "
+                            f"Initiating SYSTEM REBOOT..."
+                        )
+                        print(
+                            f"[WATCHDOG] Memory at {_usage_pct:.1f}% "
+                            f"({_avail_mb:.0f}MB free / {_total_mb:.0f}MB total). "
+                            f"Initiating SYSTEM REBOOT...",
+                            flush=True,
                         )
                         admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
                         if admin_id and application:
                             try:
                                 await application.bot.send_message(
                                     admin_id,
-                                    f"🔴 <b>CRITICAL RAM {mem_avail_mb:.0f}MB</b> "
-                                    f"< {RAM_LEVEL2_MB}MB — rebooting device!",
+                                    f"🔴 <b>RAM {_usage_pct:.1f}% ≥ {RAM_REBOOT_PERCENT}%</b> "
+                                    f"({_avail_mb:.0f}MB free) — REBOOT!",
                                     parse_mode="HTML",
                                 )
                             except Exception:
                                 pass
-                        # Write crash_report.txt before reboot
+                        # Crash report
                         try:
                             crash_path = os.path.join(FARM_DIR, "crash_report.txt")
                             with open(crash_path, "a", encoding="utf-8") as cf:
                                 cf.write(f"\n{'='*60}\n")
-                                cf.write(f"WATCHDOG LEVEL2 REBOOT @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                                cf.write(f"MemAvailable: {mem_avail_mb:.0f}MB < {RAM_LEVEL2_MB}MB\n")
-                                cf.write(f"--- /proc/meminfo ---\n{_mi[:500]}\n{'='*60}\n")
+                                cf.write(f"WATCHDOG REBOOT @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                cf.write(f"RAM: {_usage_pct:.1f}% ({_avail_mb:.0f}MB / {_total_mb:.0f}MB)\n")
+                                cf.write(f"{'='*60}\n")
                         except Exception:
                             pass
-                        # Kernel-level sysrq reboot — NO try/except, MUST execute
-                        logger.critical(">>> SYSRQ REBOOT COMMAND EXECUTING <<<")
-                        await run_bash(
-                            'su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"',
-                            timeout=10,
-                        )
-                        # Fallback if sysrq fails
-                        logger.critical(">>> SYSRQ FAILED, TRYING su -c reboot <<<")
-                        await asyncio.sleep(3)
-                        await run_bash("su -c 'reboot'", timeout=10)
-                        # If both fail, force via os
-                        logger.critical(">>> REBOOT COMMANDS FAILED, TRYING os._exit <<<")
+                        # DIRECT REBOOT — os.system, no async wrappers
+                        logger.critical(">>> EXECUTING: os.system('su -c reboot') <<<")
+                        print(">>> EXECUTING: os.system('su -c reboot') <<<", flush=True)
+                        os.system('su -c "reboot"')
+                        time.sleep(5)
+                        logger.critical(">>> reboot failed, trying sysrq <<<")
+                        os.system('su -c "echo 1 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger"')
+                        time.sleep(5)
                         os._exit(1)
 
-                    elif mem_avail_mb < RAM_LEVEL1_MB:
-                        # ── LEVEL 1: LOW — kill oldest running clone ─────
-                        # V12.4: Kill → Resurrect with cycle protection
+                    elif _usage_pct >= 90:
+                        # ── 90-97%: kill oldest clone → resurrect ────────
                         oldest_name = None
                         oldest_ts = float("inf")
                         for cname, cstate in bot_instance.clone_states.items():
@@ -572,8 +589,7 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                         if oldest_name:
                             sfx = oldest_name[-1].lower() if oldest_name.lower().startswith("clien") else oldest_name.lower()
                             logger.warning(
-                                f"OOM Level 1: {mem_avail_mb:.0f}MB < {RAM_LEVEL1_MB}MB — "
-                                f"killing oldest clone [{oldest_name}]"
+                                f"OOM: RAM {_usage_pct:.1f}% — killing oldest [{oldest_name}]"
                             )
                             await _isolated_stop(sfx)
                             bot_instance.set_state(oldest_name, CloneState.STOPPED)
@@ -582,40 +598,34 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                                 try:
                                     await application.bot.send_message(
                                         admin_id,
-                                        f"⚠️ <b>OOM Level 1: {mem_avail_mb:.0f}MB free</b>\n"
-                                        f"Killed: <code>{html.escape(oldest_name)}</code> → resurrect in 10s",
+                                        f"⚠️ <b>RAM {_usage_pct:.1f}%</b> — "
+                                        f"killed <code>{html.escape(oldest_name)}</code> → resurrect 10s",
                                         parse_mode="HTML",
                                     )
                                 except Exception:
                                     pass
-                            # V12.4: Kill → Resurrect with RAM re-check
+                            # Resurrect with RAM re-check
                             async def _resurrect_clone(rname, radmin):
                                 await asyncio.sleep(10)
-                                # Re-check RAM before resurrecting — prevent infinite cycle
                                 try:
                                     with open("/proc/meminfo", "r") as _rf:
                                         _rmi = _rf.read()
-                                    _rm = re.search(r"MemAvailable:\s+(\d+)", _rmi)
-                                    _ravail = int(_rm.group(1)) / 1024.0 if _rm else 9999
+                                    _rt = re.search(r"MemTotal:\s+(\d+)", _rmi)
+                                    _ra = re.search(r"MemAvailable:\s+(\d+)", _rmi)
+                                    if _rt and _ra:
+                                        _rpct = (int(_rt.group(1)) - int(_ra.group(1))) / int(_rt.group(1)) * 100
+                                    else:
+                                        _rpct = 0
                                 except Exception:
-                                    _ravail = 9999
-                                if _ravail < RAM_LEVEL1_MB:
-                                    logger.warning(
-                                        f"OOM Resurrect [{rname}]: RAM still low ({_ravail:.0f}MB) "
-                                        f"— skipping relaunch to prevent cycle"
-                                    )
+                                    _rpct = 0
+                                if _rpct >= 90:
+                                    logger.warning(f"Resurrect [{rname}]: RAM still {_rpct:.0f}% — skip")
                                     return
-                                logger.info(f"OOM Resurrect: relaunching [{rname}] (RAM={_ravail:.0f}MB OK)")
+                                logger.info(f"Resurrect [{rname}]: RAM {_rpct:.0f}% OK — relaunching")
                                 await bot_instance._enqueue_start(rname, radmin)
                             asyncio.create_task(_resurrect_clone(oldest_name, admin_id))
-                        else:
-                            logger.warning(
-                                f"OOM Level 1: {mem_avail_mb:.0f}MB < {RAM_LEVEL1_MB}MB — "
-                                f"no running clones to kill, syncing…"
-                            )
-                            await run_bash("su -c 'sync'", timeout=10)
                 except Exception as e:
-                    logger.error(f"OOM Protection check error: {e}", exc_info=True)
+                    logger.error(f"OOM check error: {e}", exc_info=True)
 
             await bot_instance.refresh_dashboard()
         except Exception as e:
@@ -1519,7 +1529,7 @@ class AegisBot:
             )
             _failsafe_proc.start()
             logger.info(f"Failsafe RAM watchdog started (PID {_failsafe_proc.pid}, "
-                         f"threshold={RAM_FAILSAFE_MB}MB, poll={RAM_FAILSAFE_POLL}s)")
+                         f"threshold={RAM_REBOOT_PERCENT}%, poll={RAM_WATCHDOG_POLL}s)")
         elif not HAS_ROOT:
             logger.warning("Failsafe RAM watchdog SKIPPED — no root access!")
 
