@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Aegis bot — V12.4 ZOMBIE FARM FIX (Kill→Resurrect, Heartbeat, Uptime Reboot, Detached Launch, Empty Farm Guard)
+# Aegis bot — V12.5 AGGRESSIVE ZOMBIE WATCHDOG (15s kill, 4-zombie reboot, 1h uptime, drop_caches)
 import os
 import sys
 import enum
@@ -178,15 +178,17 @@ from injection_engine    import InjectionEngine
 from bash_utils          import run_bash
 from persistence_manager import PersistenceManager
 
-VERSION = "12.4"
+VERSION = "12.5"
 
-# ── V12.4 Configuration Constants ────────────────────────────────────────────
+# ── V12.5 Configuration Constants ────────────────────────────────────────────
 ENABLE_AUTO_REBOOT = True       # Enable OOM protection + uptime reboot in watchdog
 # RAM_REBOOT_PERCENT = 98 — defined above (failsafe process uses it too)
 # RAM_WATCHDOG_POLL  = 10 — defined above
-UPTIME_REBOOT_SEC  = 3600       # V12.4: 1.5 hours → forced reboot (ugPhone cache cleanup)
+UPTIME_REBOOT_SEC  = 3600       # V12.5: 1 hour → forced reboot (was 1.5h)
 HEARTBEAT_SEC      = 30         # V12.4: heartbeat check interval (seconds)
 EMPTY_FARM_WAIT    = 120        # V12.4: seconds to wait before empty-farm guard triggers
+MAX_ZOMBIES_REBOOT = 4          # V12.5: if >= 4 simultaneous zombies → immediate reboot
+START_TIME         = time.time()  # V12.5: script start time for 1h hard timer
 # SILENT_MODE is now persisted via PersistenceManager.silent_mode (toggle in System menu)
 
 logging.basicConfig(
@@ -282,25 +284,28 @@ async def _isolated_stop(suffix: str) -> None:
 
 async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
     """
-    V12.4 Intelligent Watchdog — Net-Pulse powered + Zombie Farm Fix.
+    V12.5 Aggressive Zombie Watchdog — Net-Pulse powered.
     Runs every 15s. Only acts on clones with enabled=True in session_state.
 
     Stage 1 — Liveness:   cached PID check via /proc/{pid} → Hard Reset if gone
-    Stage 2 — TCP Guard:  CON ≤ 5 (ZOMBIE) sustained for 30s → Hard Reset
+    Stage 2 — TCP Guard:  CON ≤ 5 (ZOMBIE) sustained for 15s → pkill + restart
               CON ≥ 8  (ACTIVE) → healthy, reset zombie timer
     Stage 3 — Threads:    Deep thread check (ls /proc/PID/task).
               If TH==0 but CON>0 → ignore TH (Net-Pulse rule).
               If TH==0 and CON==0 → phantom kill.
     V12.4 — Heartbeat:    Every 30s check ALL enabled clones alive via pgrep
-    V12.4 — Uptime Reboot: /proc/uptime > 2.5h → sysrq reboot
+    V12.5 — Uptime Reboot: /proc/uptime > 1h → reboot (was 1.5h)
+    V12.5 — START_TIME timer: 1h from script start → hard reboot
     V12.4 — Empty Farm Guard: 0 running among enabled → mass restart
     V12.4 — Kill→Resurrect: OOM Level 1 kill → wait 10s → relaunch
+    V12.5 — 4+ zombies simultaneously → immediate reboot
+    V12.5 — drop_caches after each zombie pkill
     """
     GRACE_SEC    = 120    # startup grace before checking
     TCP_ACTIVE   = 8      # ≥8 → ACTIVE
     TCP_ZOMBIE   = 5      # ≤5 → ZOMBIE
-    ZOMBIE_SEC   = 30     # V12.0: 30s sustained ZOMBIE → Hard Reset
-    POLL_SEC     = 15     # V12.0: poll every 15s
+    ZOMBIE_SEC   = 15     # V12.5: 15s sustained ZOMBIE → immediate pkill+restart (was 30s)
+    POLL_SEC     = 15     # poll every 15s
 
     # Per-clone zombie timer: {name: timestamp when conns first dropped to ZOMBIE}
     tcp_low_since: Dict[str, float] = {}
@@ -336,7 +341,7 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
         try:
             now = time.time()
 
-            # ── PRIORITY 0: RAM + Uptime (checked FIRST every cycle) ──────
+            # ── PRIORITY 0: RAM + Uptime + START_TIME (checked FIRST every cycle) ──
             if ENABLE_AUTO_REBOOT:
                 try:
                     with open("/proc/meminfo", "r") as _mf:
@@ -356,14 +361,22 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                         _uptime_s = float(_uf.read().split()[0])
                     _uptime_min = _uptime_s / 60.0
 
+                    _script_age = time.time() - START_TIME  # V12.5: script runtime
+
                     _running_n = sum(
                         1 for n, s in bot_instance.clone_states.items()
                         if ":" not in n and s == CloneState.RUNNING
                     )
+                    _zombie_n = sum(
+                        1 for n in tcp_low_since
+                        if ":" not in n
+                    )
                     print(
                         f"[MEM] {_usage_pct:.1f}% ({_avail_mb:.0f}MB free / {_total_mb:.0f}MB) "
                         f"| [UPTIME] {_uptime_min:.0f} min "
+                        f"| [SCRIPT] {_script_age/60:.0f} min "
                         f"| [CLONES] {_running_n} running "
+                        f"| [ZOMBIES] {_zombie_n} "
                         f"| [STATUS] {'CRITICAL' if _usage_pct >= RAM_REBOOT_PERCENT else 'OK'}",
                         flush=True,
                     )
@@ -383,8 +396,22 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                                 pass
                         _do_reboot(f"RAM {_usage_pct:.1f}% >= {RAM_REBOOT_PERCENT}%")
 
+                    elif _zombie_n >= MAX_ZOMBIES_REBOOT:
+                        # V12.5: 4+ simultaneous zombies → network stack exhausted → reboot
+                        admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                        if admin_id and application:
+                            try:
+                                await application.bot.send_message(
+                                    admin_id,
+                                    f"🧟 <b>{_zombie_n} зомби одновременно</b> — сетевой стек устал → REBOOT!",
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                pass
+                        _do_reboot(f"{_zombie_n} simultaneous zombies >= {MAX_ZOMBIES_REBOOT}")
+
                     elif _uptime_s >= UPTIME_REBOOT_SEC:
-                        # 1.5h uptime → scheduled reboot
+                        # 1h device uptime → scheduled reboot
                         admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
                         if admin_id and application:
                             try:
@@ -397,6 +424,21 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                             except Exception:
                                 pass
                         _do_reboot(f"Uptime {_uptime_s:.0f}s >= {UPTIME_REBOOT_SEC}s")
+
+                    elif _script_age >= 3600:
+                        # V12.5: 1h since script start → hard reboot
+                        admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                        if admin_id and application:
+                            try:
+                                await application.bot.send_message(
+                                    admin_id,
+                                    f"⏱ <b>Script 1h timer</b>: скрипт работает "
+                                    f"{_script_age/60:.0f} мин → перезагрузка",
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                pass
+                        _do_reboot(f"Script age {_script_age:.0f}s >= 3600s")
 
                     elif _usage_pct >= 90:
                         # 90-97%: kill oldest clone → check if 0 alive → reboot or resurrect
@@ -500,17 +542,22 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
 
                 if uptime >= GRACE_SEC:
                     if conns <= TCP_ZOMBIE:
-                        # ZOMBIE state — Hard Reset after ZOMBIE_SEC sustained
+                        # ZOMBIE state — pkill + restart after ZOMBIE_SEC (15s) sustained
                         t0 = tcp_low_since.get(name)
                         if t0 is None:
                             tcp_low_since[name] = now
-                            logger.info(f"Watchdog [{name}]: ZOMBIE detected CON={conns}, timer started")
+                            logger.info(f"Watchdog [{name}]: ZOMBIE detected CON={conns}, timer started (15s)")
                         elif now - t0 >= ZOMBIE_SEC:
                             tcp_low_since.pop(name, None)
                             logger.warning(
                                 f"Watchdog [{name}]: ZOMBIE CON={conns} ≤ {TCP_ZOMBIE} "
-                                f"for {ZOMBIE_SEC}s → Hard Reset"
+                                f"for {ZOMBIE_SEC}s → pkill + restart"
                             )
+                            # V12.5: drop_caches after zombie pkill
+                            try:
+                                os.system('su -c "sync && echo 3 > /proc/sys/vm/drop_caches"')
+                            except Exception:
+                                pass
                             await watchdog_hard_reset(
                                 application, bot_instance, name,
                                 f"ZOMBIE TCP={conns} ≤ {TCP_ZOMBIE} for {ZOMBIE_SEC}s"
