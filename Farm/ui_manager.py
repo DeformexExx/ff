@@ -106,15 +106,17 @@ class UIManager:
         )
 
     @staticmethod
-    def get_system_keyboard(console_on: bool, restore_on: bool, silent_on: bool = True) -> InlineKeyboardMarkup:
-        c = "вкл" if console_on else "выкл"
-        r = "вкл" if restore_on else "выкл"
-        s = "вкл" if silent_on else "выкл"
+    def get_system_keyboard(console_on: bool, restore_on: bool, silent_on: bool = True, kill_oldest_on: bool = True) -> InlineKeyboardMarkup:
+        c  = "вкл" if console_on else "выкл"
+        r  = "вкл" if restore_on else "выкл"
+        s  = "вкл" if silent_on else "выкл"
+        ko = "🔴 Выкл Kill Oldest" if kill_oldest_on else "🟢 Вкл Kill Oldest"
         return InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton(f"Консоль: {c}", callback_data="toggle_console")],
                 [InlineKeyboardButton(f"AutoResume: {r}", callback_data="toggle_restore")],
                 [InlineKeyboardButton(f"Silent Mode: {s}", callback_data="toggle_silent")],
+                [InlineKeyboardButton(ko, callback_data="toggle_kill_oldest")],
                 [InlineKeyboardButton("⬅️ В меню", callback_data="nav_home")],
             ]
         )

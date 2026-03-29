@@ -441,57 +441,63 @@ async def watchdog_loop(application: Application, bot_instance: "AegisBot"):
                         _do_reboot(f"Script age {_script_age:.0f}s >= 3600s")
 
                     elif _usage_pct >= 90:
-                        # 90-97%: kill oldest clone → check if 0 alive → reboot or resurrect
-                        oldest_name = None
-                        oldest_ts = float("inf")
-                        for cname, cstate in bot_instance.clone_states.items():
-                            if ":" in cname:
-                                continue
-                            if cstate == CloneState.RUNNING:
-                                ts = bot_instance.running_since.get(cname, float("inf"))
-                                if ts < oldest_ts:
-                                    oldest_ts = ts
-                                    oldest_name = cname
-                        if oldest_name:
-                            sfx = oldest_name[-1].lower() if oldest_name.lower().startswith("clien") else oldest_name.lower()
-                            logger.warning(f"OOM: RAM {_usage_pct:.1f}% — killing oldest [{oldest_name}]")
-                            await _isolated_stop(sfx)
-                            bot_instance.set_state(oldest_name, CloneState.STOPPED)
-                            admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
-                            if admin_id and application:
-                                try:
-                                    await application.bot.send_message(
-                                        admin_id,
-                                        f"⚠️ <b>RAM {_usage_pct:.1f}%</b> — "
-                                        f"killed <code>{html.escape(oldest_name)}</code>",
-                                        parse_mode="HTML",
-                                    )
-                                except Exception:
-                                    pass
-                            # Check if 0 clones alive after kill → reboot
-                            alive_count = sum(
-                                1 for n, s in bot_instance.clone_states.items()
-                                if ":" not in n and s == CloneState.RUNNING
+                        # 90-97%: kill oldest clone (only if kill_oldest_enabled)
+                        if not bot_instance.persistence.kill_oldest_enabled:
+                            logger.info(
+                                f"RAM {_usage_pct:.1f}% >= 90% but Kill Oldest is DISABLED — waiting for 98% reboot"
                             )
-                            if alive_count == 0:
-                                _do_reboot(f"RAM {_usage_pct:.1f}% — 0 clones alive after kill")
-                            else:
-                                async def _resurrect_clone(rname, radmin):
-                                    await asyncio.sleep(10)
+                        else:
+                            # kill oldest clone → check if 0 alive → reboot or resurrect
+                            oldest_name = None
+                            oldest_ts = float("inf")
+                            for cname, cstate in bot_instance.clone_states.items():
+                                if ":" in cname:
+                                    continue
+                                if cstate == CloneState.RUNNING:
+                                    ts = bot_instance.running_since.get(cname, float("inf"))
+                                    if ts < oldest_ts:
+                                        oldest_ts = ts
+                                        oldest_name = cname
+                            if oldest_name:
+                                sfx = oldest_name[-1].lower() if oldest_name.lower().startswith("clien") else oldest_name.lower()
+                                logger.warning(f"OOM: RAM {_usage_pct:.1f}% — killing oldest [{oldest_name}]")
+                                await _isolated_stop(sfx)
+                                bot_instance.set_state(oldest_name, CloneState.STOPPED)
+                                admin_id = bot_instance.config.admin_ids[0] if bot_instance.config.admin_ids else None
+                                if admin_id and application:
                                     try:
-                                        with open("/proc/meminfo", "r") as _rf:
-                                            _rmi = _rf.read()
-                                        _rt = re.search(r"MemTotal:\s+(\d+)", _rmi)
-                                        _ra = re.search(r"MemAvailable:\s+(\d+)", _rmi)
-                                        _rpct = (int(_rt.group(1)) - int(_ra.group(1))) / int(_rt.group(1)) * 100 if _rt and _ra else 0
+                                        await application.bot.send_message(
+                                            admin_id,
+                                            f"⚠️ <b>RAM {_usage_pct:.1f}%</b> — "
+                                            f"killed <code>{html.escape(oldest_name)}</code>",
+                                            parse_mode="HTML",
+                                        )
                                     except Exception:
-                                        _rpct = 0
-                                    if _rpct >= 90:
-                                        logger.warning(f"Resurrect [{rname}]: RAM still {_rpct:.0f}% — skip")
-                                        return
-                                    logger.info(f"Resurrect [{rname}]: RAM {_rpct:.0f}% OK — relaunching")
-                                    await bot_instance._enqueue_start(rname, radmin)
-                                asyncio.create_task(_resurrect_clone(oldest_name, admin_id))
+                                        pass
+                                # Check if 0 clones alive after kill → reboot
+                                alive_count = sum(
+                                    1 for n, s in bot_instance.clone_states.items()
+                                    if ":" not in n and s == CloneState.RUNNING
+                                )
+                                if alive_count == 0:
+                                    _do_reboot(f"RAM {_usage_pct:.1f}% — 0 clones alive after kill")
+                                else:
+                                    async def _resurrect_clone(rname, radmin):
+                                        await asyncio.sleep(10)
+                                        try:
+                                            with open("/proc/meminfo", "r") as _rf:
+                                                _rmi = _rf.read()
+                                            _rt = re.search(r"MemTotal:\s+(\d+)", _rmi)
+                                            _ra = re.search(r"MemAvailable:\s+(\d+)", _rmi)
+                                            _rpct = (int(_rt.group(1)) - int(_ra.group(1))) / int(_rt.group(1)) * 100 if _rt and _ra else 0
+                                        except Exception:
+                                            _rpct = 0
+                                        if _rpct >= 90:
+                                            logger.warning(f"Resurrect [{rname}]: RAM still {_rpct:.0f}% — skip")
+                                            return
+                                        logger.info(f"Resurrect [{rname}]: RAM {_rpct:.0f}% OK — relaunching")
+                                        await bot_instance._enqueue_start(rname, radmin)
+                                    asyncio.create_task(_resurrect_clone(oldest_name, admin_id))
                 except Exception as e:
                     logger.error(f"RAM/Uptime check error: {e}", exc_info=True)
 
@@ -1022,7 +1028,8 @@ class AegisBot:
                 try:
                     await q.edit_message_reply_markup(
                         UIManager.get_system_keyboard(
-                            self._console_on, self.persistence.auto_restore, self.persistence.silent_mode))
+                            self._console_on, self.persistence.auto_restore,
+                            self.persistence.silent_mode, self.persistence.kill_oldest_enabled))
                 except Exception: pass
 
             elif d == "toggle_silent":
@@ -1031,7 +1038,8 @@ class AegisBot:
                 try:
                     await q.edit_message_reply_markup(
                         UIManager.get_system_keyboard(
-                            self._console_on, self.persistence.auto_restore, self.persistence.silent_mode))
+                            self._console_on, self.persistence.auto_restore,
+                            self.persistence.silent_mode, self.persistence.kill_oldest_enabled))
                 except Exception: pass
 
             elif d == "toggle_console":
@@ -1039,8 +1047,29 @@ class AegisBot:
                 try:
                     await q.edit_message_reply_markup(
                         UIManager.get_system_keyboard(
-                            self._console_on, self.persistence.auto_restore, self.persistence.silent_mode))
+                            self._console_on, self.persistence.auto_restore,
+                            self.persistence.silent_mode, self.persistence.kill_oldest_enabled))
                 except Exception: pass
+
+            elif d == "toggle_kill_oldest":
+                self.persistence.kill_oldest_enabled = not self.persistence.kill_oldest_enabled
+                self.persistence.save()
+                state_str = "ВКЛ 🟢" if self.persistence.kill_oldest_enabled else "ВЫКЛ 🔴"
+                try:
+                    await q.message.reply_text(
+                        f"🛡 <b>Режим защиты RAM изменён: {state_str}</b>\n"
+                        f"Kill Oldest при RAM ≥ 90%: <b>{state_str}</b>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+                try:
+                    await q.edit_message_reply_markup(
+                        UIManager.get_system_keyboard(
+                            self._console_on, self.persistence.auto_restore,
+                            self.persistence.silent_mode, self.persistence.kill_oldest_enabled))
+                except Exception:
+                    pass
 
             elif d == "sys_sync":  await self._git_sync(chat)
             elif d == "sys_screenshot": await self._take_screenshot(q.message)

@@ -67,9 +67,10 @@ class PersistenceManager:
         self.targets: dict        = {}   # {clone_name: True}
         self.active_clones: list  = []   # [clone_name, …]  — expected-running
         self.target_states: dict  = {}   # {clone_name: "RUNNING"/"STOPPED"}
-        self.auto_restore: bool   = True
-        self.console_mode: bool   = False
-        self.silent_mode:  bool   = True   # V12.2: suppress per-clone messages
+        self.auto_restore: bool        = True
+        self.console_mode: bool        = False
+        self.silent_mode:  bool        = True   # V12.2: suppress per-clone messages
+        self.kill_oldest_enabled: bool = True   # V12.5: kill oldest clone at 90% RAM
         # session_state.json data: {clone_name: {"enabled": bool, "ts": epoch}}
         self.session_state: dict  = {}
         # ────────────────────────────────────────────────────────────────────
@@ -85,10 +86,11 @@ class PersistenceManager:
             with open(self.path, "r", encoding="utf-8") as f:
                 d = json.load(f)
 
-            self.auto_restore  = d.get("auto_restore", True)
-            self.console_mode  = d.get("console_mode", False)
-            self.silent_mode   = d.get("silent_mode", True)
-            self.target_states = d.get("target_states", {})
+            self.auto_restore        = d.get("auto_restore", True)
+            self.console_mode        = d.get("console_mode", False)
+            self.silent_mode         = d.get("silent_mode", True)
+            self.kill_oldest_enabled = d.get("kill_oldest_enabled", True)
+            self.target_states       = d.get("target_states", {})
 
             # active_clones list
             ac = d.get("active_clones", [])
@@ -119,13 +121,14 @@ class PersistenceManager:
                 self.target_states[k] = str(v.value if hasattr(v, 'value') else v).upper()
 
             payload = {
-                "auto_restore":  self.auto_restore,
-                "console_mode":  self.console_mode,
-                "silent_mode":   self.silent_mode,
-                "active_clones": self.active_clones,
-                "targets":       self.targets,
-                "target_states": self.target_states,
-                "target_clones": list(self.targets.keys()),  # legacy compat
+                "auto_restore":        self.auto_restore,
+                "console_mode":        self.console_mode,
+                "silent_mode":         self.silent_mode,
+                "kill_oldest_enabled": self.kill_oldest_enabled,
+                "active_clones":       self.active_clones,
+                "targets":             self.targets,
+                "target_states":       self.target_states,
+                "target_clones":       list(self.targets.keys()),  # legacy compat
             }
             _atomic_write(self.path, payload)
         except Exception as e:
